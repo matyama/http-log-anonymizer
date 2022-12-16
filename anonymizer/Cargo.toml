@@ -1,0 +1,22 @@
+[package]
+name = "anonymizer"
+version = "0.1.0"
+authors = ["Martin Matyášek <martin.matyasek@gmail.com>"]
+description = "GDPR-complient Kafka-to-ClickHouse ETL pipeline for HTTP logs"
+repository = "https://github.com/matyama/http-log-anonymizer"
+edition = "2021"
+# TODO: license metadata
+
+[lib]
+name = "anonymizer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "anonymizer"
+path = "src/main.rs"
+
+[dependencies]
+itertools = "0.10"
+
+[dev-dependencies]
+rstest = "0.16"
