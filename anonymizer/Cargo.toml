@@ -6,6 +6,7 @@ description = "GDPR-complient Kafka-to-ClickHouse ETL pipeline for HTTP logs"
 repository = "https://github.com/matyama/http-log-anonymizer"
 edition = "2021"
 # TODO: license metadata
+build = "build.rs"
 
 [lib]
 name = "anonymizer"
@@ -16,7 +17,13 @@ name = "anonymizer"
 path = "src/main.rs"
 
 [dependencies]
+callysto = "0.1"
+capnp = "0.15"
 itertools = "0.10"
+
+[build-dependencies]
+capnpc = "0.15"
 
 [dev-dependencies]
 rstest = "0.16"
+
