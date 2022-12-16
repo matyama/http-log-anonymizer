@@ -1,0 +1,130 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+version: '3'
+services:
+  zookeeper:
+    platform: linux/x86_64
+    image: confluentinc/cp-zookeeper:7.1.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  broker:
+    image: confluentinc/cp-kafka:7.1.0
+    hostname: broker
+    container_name: broker
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_LOG_RETENTION_MS: 60000
+      KAFKA_LOG4J_LOGGERS: "kafka.controller=INFO,kafka.producer.async.DefaultEventHandler=INFO,state.change.logger=INFO"
+
+  grafana:
+    image: "grafana/grafana:8.4.5"
+    ports:
+     - "3000:3000"
+    environment:
+      GF_PATHS_DATA : /var/lib/grafana
+      GF_SECURITY_ADMIN_PASSWORD : kafka
+    volumes:
+     - ./grafana/provisioning:/etc/grafana/provisioning
+     - ./grafana/dashboards:/var/lib/grafana/dashboards
+    container_name: grafana
+    depends_on:
+     - prometheus
+
+  prometheus:
+    image: "prom/prometheus:v2.34.0"
+    ports:
+     - "9090:9090"
+    volumes:
+     - ./etc/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command: "--config.file=/etc/prometheus/prometheus.yml"
+    container_name: prometheus
+
+  jmx-kafka:
+    platform: linux/x86_64
+    image: "sscaling/jmx-prometheus-exporter"
+    ports:
+     - "5556:5556"
+    environment:
+     CONFIG_YML : "/etc/jmx_exporter/config.yml"
+    volumes:
+     - ./etc/jmx_exporter/config_kafka.yml:/etc/jmx_exporter/config.yml
+    container_name: jmx-kafka
+    depends_on:
+     - broker
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:master
+    container_name: kafka-ui
+    ports:
+      - "4000:8080"
+    restart: always
+    environment:
+      - KAFKA_CLUSTERS_0_NAME=DevEnv
+      - KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS=broker:29092
+      - KAFKA_CLUSTERS_0_ZOOKEEPER=zookeeper:2181
+    depends_on:
+      - broker
+
+  clickhouse-server:
+    image: yandex/clickhouse-server
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+      - "9009:9009"
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 262144
+        hard: 262144
+    container_name: clickhouse
+
+  ch-proxy:
+    build: docker/ch-proxy
+    ports:
+      - 8124:8124
+    restart: always
+    depends_on:
+      - clickhouse-server
+    container_name: ch-proxy
+
+  http-log-kafka-producer:
+    build: docker/http-log-kafka-producer
+    platform: linux/amd64
+    restart: always
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: "broker:29092"
+      KAFKA_PRODUCER_DELAY_MS: 5000
+    depends_on:
+      - broker
+    container_name: log-producer
