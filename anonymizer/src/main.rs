@@ -182,6 +182,10 @@ impl Context {
     }
 }
 
+/// Create new Kafka consumer and subscribe it to a topic specified in config.
+///
+/// For configuration options see:
+/// [`librdkafka` docs](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
 #[instrument(name = "create", skip_all)]
 fn create_consumer(cfg: KafkaConfig) -> rdkafka::error::KafkaResult<HttpLogConsumer> {
     let consumer: HttpLogConsumer = rdkafka::ClientConfig::new()
@@ -189,6 +193,10 @@ fn create_consumer(cfg: KafkaConfig) -> rdkafka::error::KafkaResult<HttpLogConsu
         .set("bootstrap.servers", cfg.brokers)
         .set("enable.partition.eof", "false")
         .set("session.timeout.ms", "6000")
+        .set("auto.offset.reset", "latest")
+        .set("enable.auto.commit", "true")
+        .set("auto.commit.interval.ms", "2000")
+        .set("enable.auto.offset.store", "false")
         .set("isolation.level", "read_committed")
         .set("enable.auto.commit", "false")
         .create_with_context(HttpLogConsumerContext)?;
@@ -205,15 +213,17 @@ async fn run_consumer(id: usize, ctx: Context) {
     let span = &Span::current();
 
     let consumer = create_consumer(ctx.kafka).expect("consumer creation failed");
+    let consumer = Arc::new(consumer);
 
     let stream_processor = consumer.stream().try_for_each(|msg| {
+        let consumer = consumer.clone();
         let inserter = ctx.inserter.clone();
 
         async move {
             // Process each message
             let msg = msg.detach();
 
-            let topic = msg.topic();
+            let topic = msg.topic().to_owned();
             let partition = msg.partition();
             let offset = msg.offset();
 
@@ -248,7 +258,14 @@ async fn run_consumer(id: usize, ctx: Context) {
 
                     // FIXME: do not commit immediately => inefficient & hits proxy rate limiting
                     match out.commit().await {
-                        Ok(q) => info!(quantities = ?q, "inserts committed"),
+                        Ok(q) => {
+                            info!(quantities = ?q, "inserts committed");
+                            // FIXME: saving out-of-order => potential data loss
+                            consumer
+                                .store_offset(&topic, partition, offset)
+                                // XXX: here we actually should terminate the process
+                                .expect("offsets stored");
+                        }
                         Err(_) => error!("insert commit failed"),
                     };
                 }
