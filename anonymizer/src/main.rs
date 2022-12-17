@@ -6,8 +6,10 @@ use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
 use clickhouse::Row;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
-use rdkafka::consumer::{stream_consumer::StreamConsumer, Consumer};
+use rdkafka::consumer::{stream_consumer::StreamConsumer, Consumer, ConsumerContext};
+use rdkafka::error::KafkaResult;
 use rdkafka::message::{Message, OwnedMessage};
+use rdkafka::topic_partition_list::TopicPartitionList;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
@@ -34,32 +36,19 @@ struct ClickHouseConfig {
     user: String,
     password: String,
     database: String,
+    log_table: String,
+    max_entries: u64,
+    insert_period: Option<u64>,
 }
 
-impl From<ClickHouseConfig> for clickhouse::Client {
+impl From<&ClickHouseConfig> for clickhouse::Client {
     #[inline]
-    fn from(cfg: ClickHouseConfig) -> Self {
+    fn from(cfg: &ClickHouseConfig) -> Self {
         clickhouse::Client::default()
-            .with_url(cfg.url)
-            .with_user(cfg.user)
-            .with_password(cfg.password)
-            .with_database(cfg.database)
-    }
-}
-
-impl TryFrom<KafkaConfig> for StreamConsumer {
-    type Error = rdkafka::error::KafkaError;
-
-    #[inline]
-    fn try_from(cfg: KafkaConfig) -> Result<Self, Self::Error> {
-        rdkafka::ClientConfig::new()
-            .set("group.id", cfg.group_id)
-            .set("bootstrap.servers", cfg.brokers)
-            .set("enable.partition.eof", "false")
-            .set("session.timeout.ms", "6000")
-            .set("isolation.level", "read_committed")
-            .set("enable.auto.commit", "false")
-            .create()
+            .with_url(&cfg.url)
+            .with_user(&cfg.user)
+            .with_password(&cfg.password)
+            .with_database(&cfg.database)
     }
 }
 
@@ -127,10 +116,6 @@ impl TryFrom<OwnedMessage> for HttpLog {
             .get_root::<http_log_record::Reader<'_>>()
             .expect("failed to get reader");
 
-        let ns = data.get_timestamp_epoch_milli() as i128 * 1_000_000;
-        let dt = OffsetDateTime::from_unix_timestamp_nanos(ns);
-        println!("{} {:?}", ns, dt);
-
         let timestamp = OffsetDateTime::from_unix_timestamp_nanos(
             data.get_timestamp_epoch_milli() as i128 * 1_000_000,
         )
@@ -162,6 +147,22 @@ impl TryFrom<OwnedMessage> for HttpLog {
 
 type LogInserter = clickhouse::inserter::Inserter<HttpLog>;
 
+struct HttpLogConsumerContext;
+
+impl rdkafka::client::ClientContext for HttpLogConsumerContext {}
+
+impl ConsumerContext for HttpLogConsumerContext {
+    #[instrument(skip(self, result))]
+    fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
+        match result {
+            Ok(_) => info!("offsets committed successfully"),
+            Err(e) => error!(reason = ?e, "failed to commit offsets"),
+        };
+    }
+}
+
+type HttpLogConsumer = StreamConsumer<HttpLogConsumerContext>;
+
 #[derive(Clone)]
 #[allow(unused)]
 struct Context {
@@ -171,7 +172,6 @@ struct Context {
 }
 
 impl Context {
-    // TODO: derive_new?
     #[inline]
     fn new(kafka: KafkaConfig, ch: clickhouse::Client, inserter: LogInserter) -> Self {
         Self {
@@ -182,20 +182,29 @@ impl Context {
     }
 }
 
+#[instrument(name = "create", skip_all)]
+fn create_consumer(cfg: KafkaConfig) -> rdkafka::error::KafkaResult<HttpLogConsumer> {
+    let consumer: HttpLogConsumer = rdkafka::ClientConfig::new()
+        .set("group.id", cfg.group_id)
+        .set("bootstrap.servers", cfg.brokers)
+        .set("enable.partition.eof", "false")
+        .set("session.timeout.ms", "6000")
+        .set("isolation.level", "read_committed")
+        .set("enable.auto.commit", "false")
+        .create_with_context(HttpLogConsumerContext)?;
+
+    consumer.subscribe(&[&cfg.topic])?;
+    info!(topic = cfg.topic, "subscribed new Kafka consumer");
+
+    Ok(consumer)
+}
+
 // XXX: delivery semantics => offset handling & idempotent write
 #[instrument(name = "consumer", skip(ctx))]
 async fn run_consumer(id: usize, ctx: Context) {
     let span = &Span::current();
 
-    let consumer: StreamConsumer = ctx
-        .kafka
-        .clone()
-        .try_into()
-        .expect("consumer creation failed");
-
-    consumer
-        .subscribe(&[&ctx.kafka.topic])
-        .expect("can't subscribe to specified topic");
+    let consumer = create_consumer(ctx.kafka).expect("consumer creation failed");
 
     let stream_processor = consumer.stream().try_for_each(|msg| {
         let inserter = ctx.inserter.clone();
@@ -230,6 +239,10 @@ async fn run_consumer(id: usize, ctx: Context) {
                     let _enter = insert_span.enter();
 
                     let mut out = inserter.lock().await;
+
+                    // FIXME: dev - this simulates data duplication, remove later
+                    out.write(&log).await.expect("inserter write failed");
+
                     out.write(&log).await.expect("inserter write failed");
                     debug!(partition, offset, "written log data");
 
@@ -274,14 +287,13 @@ async fn main() {
 
     info!(tasks = cfg.workers, "starting anonymizer app");
 
-    let ch = clickhouse::Client::from(cfg.ch);
+    let ch = clickhouse::Client::from(&cfg.ch);
 
     let inserter = ch
-        .inserter("http_log") // NOTE: inserter name = table name
+        .inserter(&cfg.ch.log_table) // NOTE: inserter name = table name
         .expect("failed to create new inserter")
-        .with_max_entries(10) // TODO: just for dev, use much larger value
-        //.with_max_entries(500_000)
-        .with_period(Some(Duration::from_secs(1)));
+        .with_max_entries(cfg.ch.max_entries)
+        .with_period(cfg.ch.insert_period.map(Duration::from_secs));
 
     let ctx = Context::new(cfg.kafka, ch, inserter);
 
