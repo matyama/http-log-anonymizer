@@ -127,9 +127,12 @@ impl TryFrom<OwnedMessage> for HttpLog {
             .get_root::<http_log_record::Reader<'_>>()
             .expect("failed to get reader");
 
-        // FIXME: conversion does not seem to be quite right (e.g.`1970-01-20 08:13:39`)
+        let ns = data.get_timestamp_epoch_milli() as i128 * 1_000_000;
+        let dt = OffsetDateTime::from_unix_timestamp_nanos(ns);
+        println!("{} {:?}", ns, dt);
+
         let timestamp = OffsetDateTime::from_unix_timestamp_nanos(
-            data.get_timestamp_epoch_milli() as i128 * 1000,
+            data.get_timestamp_epoch_milli() as i128 * 1_000_000,
         )
         .expect("invalid timestamp");
 
