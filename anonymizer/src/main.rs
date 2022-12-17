@@ -1,16 +1,17 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anonymizer::anonymize_ip;
-use callysto::futures::StreamExt;
-use callysto::prelude::message::*;
-use callysto::prelude::{
-    CStream, Callysto, CallystoError, Config as CallystoConfig, Context, IsolationLevel, Result,
-};
 use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
-use clickhouse::{Client, Row};
+use clickhouse::Row;
+use futures::stream::FuturesUnordered;
+use futures::{StreamExt, TryStreamExt};
+use rdkafka::consumer::{stream_consumer::StreamConsumer, Consumer};
+use rdkafka::message::{Message, OwnedMessage};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
-use tracing::{debug, error, info, instrument};
+use tokio::sync::Mutex;
+use tracing::{debug, debug_span, error, info, instrument, warn, Span};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // TODO: possibly extract to lib module
@@ -20,6 +21,54 @@ pub mod model {
 
 use crate::model::http_log_record;
 
+#[derive(Debug, Deserialize, Clone)]
+struct KafkaConfig {
+    topic: String,
+    brokers: String,
+    group_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClickHouseConfig {
+    url: String,
+    user: String,
+    password: String,
+    database: String,
+}
+
+impl From<ClickHouseConfig> for clickhouse::Client {
+    #[inline]
+    fn from(cfg: ClickHouseConfig) -> Self {
+        clickhouse::Client::default()
+            .with_url(cfg.url)
+            .with_user(cfg.user)
+            .with_password(cfg.password)
+            .with_database(cfg.database)
+    }
+}
+
+impl TryFrom<KafkaConfig> for StreamConsumer {
+    type Error = rdkafka::error::KafkaError;
+
+    #[inline]
+    fn try_from(cfg: KafkaConfig) -> Result<Self, Self::Error> {
+        rdkafka::ClientConfig::new()
+            .set("group.id", cfg.group_id)
+            .set("bootstrap.servers", cfg.brokers)
+            .set("enable.partition.eof", "false")
+            .set("session.timeout.ms", "6000")
+            .set("isolation.level", "read_committed")
+            .set("enable.auto.commit", "false")
+            .create()
+    }
+}
+
+const DEFAULT_WORKERS: usize = 4;
+#[inline(always)]
+const fn default_workers() -> usize {
+    DEFAULT_WORKERS
+}
+
 const DEFAULT_RUST_LOG: &str = "INFO";
 #[inline(always)]
 fn default_rust_log() -> String {
@@ -28,12 +77,17 @@ fn default_rust_log() -> String {
 
 #[derive(Debug, Deserialize)]
 struct Config {
+    #[serde(default = "default_workers")]
+    workers: usize,
     #[serde(default = "default_rust_log")]
     rust_log: String,
+    kafka: KafkaConfig,
+    ch: ClickHouseConfig,
 }
 
 impl Config {
-    pub fn from_env() -> std::result::Result<Self, config::ConfigError> {
+    #[inline]
+    pub fn from_env() -> Result<Self, config::ConfigError> {
         config::Config::builder()
             .add_source(config::Environment::default().separator("__"))
             .build()?
@@ -44,7 +98,7 @@ impl Config {
 // TODO: ClickHouse works with `&str` or
 //  - https://docs.rs/smartstring/latest/smartstring/struct.SmartString.html
 //  - or possibly https://docs.rs/serde_bytes/latest/serde_bytes/
-#[allow(dead_code)]
+#[allow(unused)]
 #[derive(Debug, Row, Serialize)]
 struct HttpLog {
     #[serde(with = "clickhouse::serde::time::datetime")]
@@ -61,9 +115,9 @@ struct HttpLog {
 
 impl TryFrom<OwnedMessage> for HttpLog {
     // TODO: thiserror and/or anyhow
-    type Error = CallystoError;
+    type Error = ();
 
-    fn try_from(value: OwnedMessage) -> Result<Self> {
+    fn try_from(value: OwnedMessage) -> Result<Self, Self::Error> {
         let mut buffer = value.payload().expect("failed to get message payload");
 
         let raw_data = read_message_from_flat_slice(&mut buffer, ReaderOptions::new())
@@ -103,77 +157,111 @@ impl TryFrom<OwnedMessage> for HttpLog {
     }
 }
 
+type LogInserter = clickhouse::inserter::Inserter<HttpLog>;
+
 #[derive(Clone)]
-struct SharedState {
-    client: Arc<Client>,
+#[allow(unused)]
+struct Context {
+    kafka: KafkaConfig,
+    ch: Arc<clickhouse::Client>,
+    inserter: Arc<Mutex<LogInserter>>,
 }
 
-impl SharedState {
+impl Context {
+    // TODO: derive_new?
     #[inline]
-    fn new(client: Client) -> Self {
+    fn new(kafka: KafkaConfig, ch: clickhouse::Client, inserter: LogInserter) -> Self {
         Self {
-            client: Arc::new(client),
+            kafka,
+            ch: Arc::new(ch),
+            inserter: Arc::new(Mutex::new(inserter)),
         }
     }
 }
 
-#[instrument(skip_all)]
-async fn anonymizer_agent(mut stream: CStream, ctx: Context<SharedState>) -> Result<()> {
-    let state = ctx.state();
+// XXX: delivery semantics => offset handling & idempotent write
+#[instrument(name = "consumer", skip(ctx))]
+async fn run_consumer(id: usize, ctx: Context) {
+    let span = &Span::current();
 
-    // TODO: extract configs
-    // TODO: consider sharing the inserter directly, not the whole client
-    // TODO: delivery semantics => offset handling & idempotent write
-    let mut inserter = state
-        .client
-        .inserter("http_log") // NOTE: inserter name = table name
-        .expect("failed to create new inserter")
-        .with_max_entries(10) // TODO: just for dev, use much larger value
-        //.with_max_entries(500_000)
-        .with_period(Some(Duration::from_secs(1)));
+    let consumer: StreamConsumer = ctx
+        .kafka
+        .clone()
+        .try_into()
+        .expect("consumer creation failed");
 
-    while let Some(msg) = stream.next().await {
-        let mut log = msg
-            .map(|m| {
-                // TODO: dev => remove
-                debug!("received {:?}", m);
+    consumer
+        .subscribe(&[&ctx.kafka.topic])
+        .expect("can't subscribe to specified topic");
+
+    let stream_processor = consumer.stream().try_for_each(|msg| {
+        let inserter = ctx.inserter.clone();
+
+        async move {
+            // Process each message
+            let msg = msg.detach();
+
+            let topic = msg.topic();
+            let partition = msg.partition();
+            let offset = msg.offset();
+
+            debug!(parent: span, topic, partition, offset, "processing message");
+
+            let task_span = debug_span!("task");
+
+            tokio::spawn(async move {
+                let _enter = task_span.enter();
+                // executed on the main thread pool
 
                 // TODO: filter out invalid msgs (or rather report them to stats)
-                HttpLog::try_from(m).expect("valid message")
-            })
-            .expect("infinite Kafka stream");
+                let mut log = HttpLog::try_from(msg).expect("valid message");
+                debug!(partition, offset, "message parsed");
 
-        // TODO: dev => remove
-        debug!("parsed {:?}", log);
+                log.remote_addr = anonymize_ip(log.remote_addr);
+                debug!(partition, offset, ?log, "anonymized");
 
-        log.remote_addr = anonymize_ip(log.remote_addr);
-        //debug!("anonymized", log=?log);
-        debug!("anonymized {:?}", log);
+                // XXX: consider keeping just single consumer and scale the group horizontally
+                // critical write section
+                let insert_span = debug_span!("insert");
+                {
+                    let _enter = insert_span.enter();
 
-        inserter.write(&log).await.expect("inserter write failed");
+                    let mut out = inserter.lock().await;
+                    out.write(&log).await.expect("inserter write failed");
+                    debug!(partition, offset, "written log data");
 
-        // FIXME: do not commit immediately => inefficient & hits proxy rate limiting
-        let Ok(_) = inserter.commit().await else {
-            error!("inserter commit failed");
-            continue;
-        };
-    }
+                    // FIXME: do not commit immediately => inefficient & hits proxy rate limiting
+                    match out.commit().await {
+                        Ok(q) => info!(quantities = ?q, "inserts committed"),
+                        Err(_) => error!("insert commit failed"),
+                    };
+                }
+            });
 
-    // graceful shutdown: terminate inserting
-    inserter
-        .end()
-        .await
-        .expect("inserter shutdown flush failed");
+            Ok(())
+        }
+    });
 
-    Ok(())
+    info!("starting event loop");
+    stream_processor.await.expect("stream processing failed");
+    warn!("stream processing terminated");
+
+    // TODO: graceful shutdown: terminate inserting
+    //inserter
+    //    .end()
+    //    .await
+    //    .expect("inserter shutdown flush failed");
 }
 
-fn main() {
+// TODO: decide which crate to use to implement the pipeline (this is just a demo)
+// TODO: setup shutdown hook & graceful shutdown in general
+#[tokio::main]
+async fn main() {
     // NOTE: proxy does the recommended 1s rate limiting - need to handle these "errors"
     // TODO: address - latency, data loss, data duplication
 
     // read configuration from env
-    let cfg = Config::from_env().expect("failed to read configuration from environment");
+    let cfg = Config::from_env().expect("configuration from environment");
 
     // setup tracing
     tracing_subscriber::registry()
@@ -181,31 +269,23 @@ fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    //let ch_proxy_url = "http://ch-proxy:8124";
-    let ch_proxy_url = "http://localhost:8124";
+    info!(tasks = cfg.workers, "starting anonymizer app");
 
-    // TODO: from env
-    let client = Client::default()
-        .with_url(ch_proxy_url)
-        .with_user("default")
-        .with_password("")
-        .with_database("default");
+    let ch = clickhouse::Client::from(cfg.ch);
 
-    // TODO: decide which crate to use to implement the pipeline (this is just a demo)
-    let mut app = Callysto::with_state(SharedState::new(client));
+    let inserter = ch
+        .inserter("http_log") // NOTE: inserter name = table name
+        .expect("failed to create new inserter")
+        .with_max_entries(10) // TODO: just for dev, use much larger value
+        //.with_max_entries(500_000)
+        .with_period(Some(Duration::from_secs(1)));
 
-    let mut config = CallystoConfig::default();
-    config.kafka_config.isolation_level = IsolationLevel::ReadCommitted;
-    //config.kafka_config.enable_auto_commit = false;
+    let ctx = Context::new(cfg.kafka, ch, inserter);
 
-    // TODO: include ID arg (for replica distinction)
-    app.with_name("anonymizer").with_config(config);
-
-    // TODO: topic, group_id form env
-    // TODO: each agent is spawned as a new task => include id (number from args)
-    app.agent("anonymizer_agent", app.topic("http_log"), anonymizer_agent);
-
-    // TODO: propper logging/tracing
-    info!("starting anonymizer app");
-    app.run();
+    // TODO: improve
+    (0..cfg.workers)
+        .map(|i| tokio::spawn(run_consumer(i, ctx.clone())))
+        .collect::<FuturesUnordered<_>>()
+        .for_each(|_| async {})
+        .await
 }
