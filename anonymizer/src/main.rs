@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use anonymizer::anonymize_ip;
 use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
-use clickhouse::inserter::Inserter;
 use clickhouse::Row;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
@@ -50,11 +49,16 @@ impl From<&ClickHouseConfig> for clickhouse::Client {
     fn from(cfg: &ClickHouseConfig) -> Self {
         use hyper::client::connect::HttpConnector;
 
+        // FIXME: check https://github.com/hyperium/hyper/issues/2720
+        //  - this might be the cause of these "IncompleteMessage" errors
+
         let mut connector = HttpConnector::new();
         connector.set_keepalive(Some(Duration::from_secs(cfg.tcp_keepalive)));
 
         let client = hyper::Client::builder()
             .pool_idle_timeout(Duration::from_secs(cfg.pool_idle_timeout))
+            // XXX: disabling pooling - an attempt to make it work
+            //.pool_max_idle_per_host(0)
             .build(connector);
 
         clickhouse::Client::with_http_client(client)
@@ -65,10 +69,10 @@ impl From<&ClickHouseConfig> for clickhouse::Client {
     }
 }
 
-const DEFAULT_WORKERS: usize = 4;
+const DEFAULT_NUM_CONSUMERS: usize = 1;
 #[inline(always)]
-const fn default_workers() -> usize {
-    DEFAULT_WORKERS
+const fn default_num_consumers() -> usize {
+    DEFAULT_NUM_CONSUMERS
 }
 
 const DEFAULT_RUST_LOG: &str = "INFO";
@@ -79,8 +83,8 @@ fn default_rust_log() -> String {
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    #[serde(default = "default_workers")]
-    workers: usize,
+    #[serde(default = "default_num_consumers")]
+    num_consumers: usize,
     #[serde(default = "default_rust_log")]
     rust_log: String,
     kafka: KafkaConfig,
@@ -181,11 +185,11 @@ struct HttpLogConsumerContext;
 impl rdkafka::client::ClientContext for HttpLogConsumerContext {}
 
 impl ConsumerContext for HttpLogConsumerContext {
-    #[instrument(skip(self, result))]
-    fn commit_callback(&self, result: KafkaResult<()>, _offsets: &TopicPartitionList) {
+    #[instrument(name = "commit", skip_all)]
+    fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {
         match result {
-            Ok(_) => info!("offsets committed successfully"),
-            Err(e) => error!(reason = ?e, "failed to commit offsets"),
+            Ok(_) => info!(?offsets, "offsets committed successfully"),
+            Err(e) => error!(cause = ?e, "failed to commit offsets"),
         };
     }
 }
@@ -207,17 +211,33 @@ struct ClickHouseSink {
     /// Offsets of the last written logs for each partition and [topic]
     tpl: TopicPartitionList,
     /// ClickHouse [`Inserter`](clickhouse::inserter::Inserter) for [`HttpLog`]
-    inserter: Inserter<HttpLog>,
+    inserter: LogInserter,
 }
 
 impl ClickHouseSink {
-    #[inline]
-    fn new(topic: String, inserter: Inserter<HttpLog>) -> Self {
+    fn new(topic: String, cfg: ClickHouseConfig, ch: clickhouse::Client) -> Self {
+        let inserter = ch
+            .inserter(&cfg.log_table)
+            .expect("failed to create new clickhouse inserter")
+            .with_max_entries(cfg.max_entries)
+            .with_period(cfg.insert_period.map(Duration::from_secs));
+
         Self {
             topic,
             tpl: TopicPartitionList::new(),
             inserter,
         }
+    }
+
+    fn record_offset(&mut self, partition: i32, offset: i64) {
+        let mut p = match self.tpl.find_partition(&self.topic, partition) {
+            Some(p) => p,
+            None => self.tpl.add_partition(&self.topic, partition),
+        };
+
+        // XXX: offset + 1 (?)
+        p.set_offset(Offset::Offset(offset))
+            .expect("Kafka offset update");
     }
 
     // TODO: proper error type
@@ -231,16 +251,7 @@ impl ClickHouseSink {
 
         debug!(partition, offset, "written log data");
 
-        {
-            let mut p = match self.tpl.find_partition(&self.topic, partition) {
-                Some(p) => p,
-                None => self.tpl.add_partition(&self.topic, partition),
-            };
-
-            // XXX: offset + 1 (?)
-            p.set_offset(Offset::Offset(offset))
-                .expect("Kafka offset update");
-        }
+        self.record_offset(partition, offset);
 
         // XXX: Is this pre-commit check even necessary?
         let time_left = self.inserter.time_left();
@@ -255,7 +266,7 @@ impl ClickHouseSink {
         match self.inserter.commit().await {
             // TODO: should commit only if q > 0
             Ok(q) => {
-                info!(partition, quantities = ?q, "inserts committed");
+                info!(partition, rows = q.entries, "inserts committed");
                 // NOTE: commit is done only once in a while so the clone should be fine
                 ImportResult::Success(self.tpl.clone())
             }
@@ -265,25 +276,6 @@ impl ClickHouseSink {
                 // panic!();
                 ImportResult::Failure(())
             }
-        }
-    }
-}
-
-#[derive(Clone)]
-#[allow(unused)]
-struct Context {
-    kafka: KafkaConfig,
-    ch: Arc<clickhouse::Client>,
-    sink: Arc<Mutex<ClickHouseSink>>,
-}
-
-impl Context {
-    fn new(kafka: KafkaConfig, ch: clickhouse::Client, inserter: LogInserter) -> Self {
-        let topic = kafka.topic.clone();
-        Self {
-            kafka,
-            ch: Arc::new(ch),
-            sink: Arc::new(Mutex::new(ClickHouseSink::new(topic, inserter))),
         }
     }
 }
@@ -314,19 +306,17 @@ fn create_consumer(cfg: KafkaConfig) -> rdkafka::error::KafkaResult<HttpLogConsu
     Ok(consumer)
 }
 
-// TODO: struct KafkaSource, struct HttpLogConsumer
-
 // XXX: delivery semantics => offset handling & idempotent write
-#[instrument(name = "consumer", skip(ctx))]
-async fn run_consumer(id: usize, ctx: Context) {
+#[instrument(name = "consumer", skip(kafka, sink))]
+async fn run_consumer(id: usize, kafka: KafkaConfig, sink: Arc<Mutex<ClickHouseSink>>) {
     let span = &Span::current();
 
-    let consumer = create_consumer(ctx.kafka).expect("consumer creation failed");
+    let consumer = create_consumer(kafka).expect("consumer creation failed");
     let consumer = Arc::new(consumer);
 
     let stream_processor = consumer.stream().try_for_each(|msg| {
         let consumer = consumer.clone();
-        let sink = ctx.sink.clone();
+        let sink = sink.clone();
 
         async move {
             // process a message
@@ -403,9 +393,6 @@ async fn make_table(ch: &clickhouse::Client, table: &str) {
 // TODO: setup shutdown hook & graceful shutdown in general
 #[tokio::main]
 async fn main() {
-    // NOTE: proxy does the recommended 1s rate limiting - need to handle these "errors"
-    // TODO: address - latency, data loss, data duplication
-
     // read configuration from env
     let cfg = Config::from_env().expect("configuration from environment");
 
@@ -415,8 +402,12 @@ async fn main() {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    info!(tasks = cfg.workers, "starting anonymizer pipeline");
+    info!(
+        consumers = cfg.num_consumers,
+        "starting anonymizer pipeline"
+    );
 
+    // XXX: possibly move to `ClickHouseSink::new`
     let ch = clickhouse::Client::from(&cfg.ch);
     info!(
         url = cfg.ch.url,
@@ -424,19 +415,17 @@ async fn main() {
         "clickhouse client created"
     );
 
+    // make sure that the log table exists
     make_table(&ch, &cfg.ch.log_table).await;
 
-    let inserter = ch
-        .inserter(&cfg.ch.log_table) // NOTE: inserter name = table name
-        .expect("failed to create new clickhouse inserter")
-        .with_max_entries(cfg.ch.max_entries)
-        .with_period(cfg.ch.insert_period.map(Duration::from_secs));
+    let topic = cfg.kafka.topic.clone();
 
-    let ctx = Context::new(cfg.kafka, ch, inserter);
+    // crete a shared clickhouse sink
+    let sink = Arc::new(Mutex::new(ClickHouseSink::new(topic, cfg.ch, ch)));
 
-    // TODO: improve
-    (0..cfg.workers)
-        .map(|i| tokio::spawn(run_consumer(i, ctx.clone())))
+    // spawn a group of Kafka consumers
+    (0..cfg.num_consumers)
+        .map(|i| tokio::spawn(run_consumer(i, cfg.kafka.clone(), sink.clone())))
         .collect::<FuturesUnordered<_>>()
         .for_each(|_| async {})
         .await

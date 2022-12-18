@@ -1,0 +1,17 @@
+# Env files
+.env
+.envrc
+
+# Docs and other irrelevant sources
+README.md
+LICENSE
+
+# Git
+.git
+.gitignore
+
+# Docker
+.dockerignore
+Dockerfile
+docker-compose.yml
+
