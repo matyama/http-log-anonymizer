@@ -21,6 +21,7 @@ capnp = "0.15"
 clickhouse = { version = "0.11", features = ["time"] }
 config = "0.13"
 futures = "0.3"
+hyper = { version = "0.14", features = ["client", "tcp", "http1", "stream", "server"] }
 itertools = "0.10"
 # TODO: `features = ["dynamic-linking"] ` for `librdkafka`
 rdkafka = "0.29"

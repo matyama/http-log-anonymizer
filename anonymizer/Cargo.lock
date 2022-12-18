@@ -22,6 +22,7 @@ dependencies = [
  "clickhouse",
  "config",
  "futures",
+ "hyper",
  "itertools",
  "rdkafka",
  "rstest",
