@@ -26,6 +26,7 @@ config = "0.13"
 futures = "0.3"
 hyper = { version = "0.14", features = ["client", "tcp", "http1", "stream", "server"] }
 itertools = "0.10"
+maplit = "1.0"
 rdkafka = "0.29"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

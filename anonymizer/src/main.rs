@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use anonymizer::{anonymize_ip, limiter::RequestLimiter};
+use anonymizer::{anonymize_ip, kafka::OffsetTracker, limiter::RequestLimiter};
 use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
 use clickhouse_http_client::clickhouse_format::input::JsonCompactEachRowInput;
 use clickhouse_http_client::isahc::prelude::Configurable;
@@ -12,7 +12,6 @@ use rdkafka::consumer::{stream_consumer::StreamConsumer, Consumer, ConsumerConte
 use rdkafka::error::KafkaResult;
 use rdkafka::message::{Message, OwnedMessage};
 use rdkafka::topic_partition_list::TopicPartitionList;
-use rdkafka::Offset;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -251,12 +250,6 @@ enum ImportResult<E> {
 }
 
 struct ClickHouseSink {
-    /// Single Kafka topic that's being consumed
-    topic: String,
-
-    /// Offsets of the last written logs for each partition and [topic]
-    tpl: TopicPartitionList,
-
     /// ClickHouse [`Client`](clickhouse_http_client::Client) for [`HttpLog`]
     ch: clickhouse_http_client::Client,
 
@@ -267,6 +260,9 @@ struct ClickHouseSink {
     /// [JsonCompactEachRow](https://clickhouse.com/docs/en/interfaces/formats/#jsoncompacteachrow)
     /// format.
     buffer: Vec<CompactJsonRow>,
+
+    /// Tracker of Kafka offsets corresponding to the last written [`HttpLog`].
+    offset_tracker: OffsetTracker,
 
     /// Limiter that keeps track of the maximum allowed request rate for ClickHouse queries.
     request_limiter: RequestLimiter,
@@ -289,25 +285,11 @@ impl ClickHouseSink {
         let request_limiter = RequestLimiter::new(cfg.insert_period.unwrap_or(65));
 
         Self {
-            topic,
-            tpl: TopicPartitionList::new(),
             ch,
             buffer: Vec::new(),
+            offset_tracker: OffsetTracker::new(topic),
             request_limiter,
         }
-    }
-
-    fn record_offset(&mut self, partition: i32, offset: i64) {
-        // XXX: test/assert - write(partition, offset, _) => offset = tpl[partition] + 1
-
-        let mut p = match self.tpl.find_partition(&self.topic, partition) {
-            Some(p) => p,
-            None => self.tpl.add_partition(&self.topic, partition),
-        };
-
-        // XXX: offset + 1 (?)
-        p.set_offset(Offset::Offset(offset))
-            .expect("Kafka offset update");
     }
 
     // TODO: proper error type
@@ -322,7 +304,7 @@ impl ClickHouseSink {
 
         debug!(partition, offset, "written log data");
 
-        self.record_offset(partition, offset);
+        self.offset_tracker.store(partition, offset);
 
         let time_left = self.request_limiter.remaining_time();
 
@@ -349,7 +331,7 @@ impl ClickHouseSink {
             Ok(()) => {
                 info!(partition, rows = entries, "inserts committed");
                 // NOTE: commit is done only once in a while so the clone should be fine
-                ImportResult::Success(self.tpl.clone())
+                ImportResult::Success(self.offset_tracker.load())
             }
             Err(e) => {
                 error!(partition, error = ?e, "insert commit failed: {:?}", e);

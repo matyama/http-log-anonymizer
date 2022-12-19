@@ -1,6 +1,7 @@
 use itertools::Itertools;
 use std::net::IpAddr;
 
+pub mod kafka;
 pub mod limiter;
 
 /// Anonymize an IP address by replacing the last octet with 'x'.
