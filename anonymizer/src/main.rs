@@ -88,12 +88,20 @@ fn default_rust_log() -> String {
     DEFAULT_RUST_LOG.to_string()
 }
 
+const DEFAULT_SKIP_DDL: bool = false;
+#[inline(always)]
+fn default_skip_ddl() -> bool {
+    DEFAULT_SKIP_DDL
+}
+
 #[derive(Debug, Deserialize)]
 struct Config {
     #[serde(default = "default_num_consumers")]
     num_consumers: usize,
     #[serde(default = "default_rust_log")]
     rust_log: String,
+    #[serde(default = "default_skip_ddl")]
+    skip_ddl: bool,
     kafka: KafkaConfig,
     ch: ClickHouseConfig,
 }
@@ -200,13 +208,11 @@ impl TryFrom<OwnedMessage> for HttpLog {
 
 type CompactJsonRow = Vec<Value>;
 
-// XXX: or `From<&HttpLog>`
 impl From<HttpLog> for CompactJsonRow {
     #[inline]
     fn from(value: HttpLog) -> Self {
         vec![
-            // FIXME: value.timestamp.into(),
-            0.into(),
+            value.timestamp.unix_timestamp().into(),
             value.resource_id.into(),
             value.bytes_sent.into(),
             value.request_time_milli.into(),
@@ -268,14 +274,16 @@ struct ClickHouseSink {
 
 impl ClickHouseSink {
     #[instrument(name = "sink", skip(cfg))]
-    async fn new(topic: String, cfg: ClickHouseConfig) -> Self {
+    async fn new(topic: String, cfg: ClickHouseConfig, skip_ddl: bool) -> Self {
         // TODO: create DDLs from cfg.target_table
 
         let ch = clickhouse_http_client::Client::try_from(&cfg).expect("clickhouse client created");
         info!(url = cfg.url, user = cfg.user, "clickhouse client created");
 
-        // make sure that the log table exists
-        make_table(&ch, &cfg.target_table).await;
+        if !skip_ddl {
+            // make sure that the log table exists
+            make_table(&ch, &cfg.target_table).await;
+        }
 
         // XXX: does insert_period have to be an option? => use None to _disable_ rate limit
         let request_limiter = RequestLimiter::new(cfg.insert_period.unwrap_or(65));
@@ -478,7 +486,7 @@ async fn main() {
     let topic = cfg.kafka.topic.clone();
 
     // crete a shared clickhouse sink
-    let sink = ClickHouseSink::new(topic, cfg.ch).await;
+    let sink = ClickHouseSink::new(topic, cfg.ch, cfg.skip_ddl).await;
     let sink = Arc::new(Mutex::new(sink));
 
     // spawn a group of Kafka consumers
