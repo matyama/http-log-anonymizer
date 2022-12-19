@@ -1,9 +1,10 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anonymizer::anonymize_ip;
 use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
-use clickhouse::Row;
+use clickhouse_http_client::clickhouse_format::input::JsonCompactEachRowInput;
+use clickhouse_http_client::isahc::prelude::Configurable;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt};
 use rdkafka::consumer::CommitMode;
@@ -13,6 +14,7 @@ use rdkafka::message::{Message, OwnedMessage};
 use rdkafka::topic_partition_list::TopicPartitionList;
 use rdkafka::Offset;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tracing::{debug, debug_span, error, info, instrument, warn, Span};
@@ -39,33 +41,38 @@ struct ClickHouseConfig {
     password: String,
     database: String,
     tcp_keepalive: u64,
-    pool_idle_timeout: u64,
-    log_table: String,
+    target_table: String,
+    #[allow(unused)]
     max_entries: u64,
     insert_period: Option<u64>,
 }
 
-impl From<&ClickHouseConfig> for clickhouse::Client {
-    fn from(cfg: &ClickHouseConfig) -> Self {
-        use hyper::client::connect::HttpConnector;
+impl TryFrom<&ClickHouseConfig> for clickhouse_http_client::Client {
+    type Error = clickhouse_http_client::Error;
 
-        // FIXME: check https://github.com/hyperium/hyper/issues/2720
-        //  - this might be the cause of these "IncompleteMessage" errors
+    fn try_from(cfg: &ClickHouseConfig) -> Result<Self, Self::Error> {
+        let mut builder =
+            clickhouse_http_client::ClientBuilder::new().configurable(|http_client_builder| {
+                http_client_builder
+                    // TODO: add to env config & possibly deprecate pool_idle_timeout
+                    .timeout(Duration::from_secs(5))
+                    // XXX: these can potentially be on defaults if rate limiter is disabled
+                    .max_connections(1)
+                    .max_connections_per_host(1)
+                    .tcp_keepalive(Duration::from_secs(cfg.tcp_keepalive))
+            });
 
-        let mut connector = HttpConnector::new();
-        connector.set_keepalive(Some(Duration::from_secs(cfg.tcp_keepalive)));
+        builder.set_url(&cfg.url)?;
 
-        let client = hyper::Client::builder()
-            .pool_idle_timeout(Duration::from_secs(cfg.pool_idle_timeout))
-            // XXX: disabling pooling - an attempt to make it work
-            //.pool_max_idle_per_host(0)
-            .build(connector);
+        let mut ch = builder.build()?;
+        // TODO: propagate errors
+        ch.set_username_to_header(&cfg.user).expect("valid ch user");
+        ch.set_password_to_header(&cfg.password)
+            .expect("valid ch password");
+        ch.set_database_to_header(&cfg.database)
+            .expect("valid ch database");
 
-        clickhouse::Client::with_http_client(client)
-            .with_url(&cfg.url)
-            .with_user(&cfg.user)
-            .with_password(&cfg.password)
-            .with_database(&cfg.database)
+        Ok(ch)
     }
 }
 
@@ -101,8 +108,9 @@ impl Config {
     }
 }
 
+// FIXME: hard-coded table identifier
 const TABLE_DDL: &str = "
-      CREATE TABLE IF NOT EXISTS ? (
+      CREATE TABLE IF NOT EXISTS http_log (
         timestamp DateTime NOT NULL,
         resource_id UInt64 NOT NULL,
         bytes_sent UInt64 NOT NULL,
@@ -117,13 +125,25 @@ const TABLE_DDL: &str = "
       PARTITION BY toYYYYMM(timestamp)
       ORDER BY (resource_id, response_status, remote_addr, timestamp)";
 
+const INSERT_DDL: &str = "
+      INSERT INTO http_log (
+          timestamp,
+          resource_id,
+          bytes_sent,
+          request_time_milli,
+          response_status,
+          cache_status,
+          method,
+          remote_addr,
+          url
+      )";
+
 // TODO: ClickHouse works with `&str` or
 //  - https://docs.rs/smartstring/latest/smartstring/struct.SmartString.html
 //  - or possibly https://docs.rs/serde_bytes/latest/serde_bytes/
-#[allow(unused)]
-#[derive(Debug, Row, Serialize)]
+#[derive(Debug, Serialize)]
 struct HttpLog {
-    #[serde(with = "clickhouse::serde::time::datetime")]
+    #[serde(with = "time::serde::timestamp")]
     timestamp: OffsetDateTime,
     resource_id: u64,
     bytes_sent: u64,
@@ -178,7 +198,26 @@ impl TryFrom<OwnedMessage> for HttpLog {
     }
 }
 
-type LogInserter = clickhouse::inserter::Inserter<HttpLog>;
+type CompactJsonRow = Vec<Value>;
+
+// XXX: or `From<&HttpLog>`
+impl From<HttpLog> for CompactJsonRow {
+    #[inline]
+    fn from(value: HttpLog) -> Self {
+        vec![
+            // FIXME: value.timestamp.into(),
+            0.into(),
+            value.resource_id.into(),
+            value.bytes_sent.into(),
+            value.request_time_milli.into(),
+            value.response_status.into(),
+            value.cache_status.into(),
+            value.method.into(),
+            value.remote_addr.into(),
+            value.url.into(),
+        ]
+    }
+}
 
 struct HttpLogConsumerContext;
 
@@ -196,6 +235,35 @@ impl ConsumerContext for HttpLogConsumerContext {
 
 type HttpLogConsumer = StreamConsumer<HttpLogConsumerContext>;
 
+// TODO: extract to lib & test
+struct RequestLimiter {
+    /// The rate with each request can be sent in seconds.
+    request_rate: Duration,
+    /// The timestamp of the last issued request.
+    last_request: Instant,
+}
+
+impl RequestLimiter {
+    #[inline]
+    fn new(request_rate: u64) -> Self {
+        Self {
+            request_rate: Duration::from_secs(request_rate),
+            last_request: Instant::now(),
+        }
+    }
+
+    #[inline]
+    fn remaining_time(&self) -> Duration {
+        self.request_rate
+            .saturating_sub(self.last_request.elapsed())
+    }
+
+    #[inline]
+    fn record_request(&mut self) {
+        self.last_request = Instant::now();
+    }
+}
+
 enum ImportResult<E> {
     /// Insert is in progress, buffering the logs
     Pending,
@@ -208,28 +276,51 @@ enum ImportResult<E> {
 struct ClickHouseSink {
     /// Single Kafka topic that's being consumed
     topic: String,
+
     /// Offsets of the last written logs for each partition and [topic]
     tpl: TopicPartitionList,
-    /// ClickHouse [`Inserter`](clickhouse::inserter::Inserter) for [`HttpLog`]
-    inserter: LogInserter,
+
+    /// ClickHouse [`Client`](clickhouse_http_client::Client) for [`HttpLog`]
+    ch: clickhouse_http_client::Client,
+
+    /// Buffered data for the next output (ClickHouse insert)
+    ///
+    /// Original [`HttpLog`] data are stored as [`serde_json::Value`](serde_json::Value)s and sent
+    /// to ClickHouse as an insert with values in the
+    /// [JsonCompactEachRow](https://clickhouse.com/docs/en/interfaces/formats/#jsoncompacteachrow)
+    /// format.
+    buffer: Vec<CompactJsonRow>,
+
+    /// Limiter that keeps track of the maximum allowed request rate for ClickHouse queries.
+    request_limiter: RequestLimiter,
 }
 
 impl ClickHouseSink {
-    fn new(topic: String, cfg: ClickHouseConfig, ch: clickhouse::Client) -> Self {
-        let inserter = ch
-            .inserter(&cfg.log_table)
-            .expect("failed to create new clickhouse inserter")
-            .with_max_entries(cfg.max_entries)
-            .with_period(cfg.insert_period.map(Duration::from_secs));
+    #[instrument(name = "sink", skip(cfg))]
+    async fn new(topic: String, cfg: ClickHouseConfig) -> Self {
+        // TODO: create DDLs from cfg.target_table
+
+        let ch = clickhouse_http_client::Client::try_from(&cfg).expect("clickhouse client created");
+        info!(url = cfg.url, user = cfg.user, "clickhouse client created");
+
+        // make sure that the log table exists
+        make_table(&ch, &cfg.target_table).await;
+
+        // XXX: does insert_period have to be an option? => use None to _disable_ rate limit
+        let request_limiter = RequestLimiter::new(cfg.insert_period.unwrap_or(65));
 
         Self {
             topic,
             tpl: TopicPartitionList::new(),
-            inserter,
+            ch,
+            buffer: Vec::new(),
+            request_limiter,
         }
     }
 
     fn record_offset(&mut self, partition: i32, offset: i64) {
+        // XXX: test/assert - write(partition, offset, _) => offset = tpl[partition] + 1
+
         let mut p = match self.tpl.find_partition(&self.topic, partition) {
             Some(p) => p,
             None => self.tpl.add_partition(&self.topic, partition),
@@ -241,32 +332,43 @@ impl ClickHouseSink {
     }
 
     // TODO: proper error type
-    // FIXME: error=error=Network(hyper::Error(IncompleteMessage))
     #[instrument(skip(self, log))]
-    async fn write(&mut self, partition: i32, offset: i64, log: HttpLog) -> ImportResult<()> {
-        self.inserter
-            .write(&log)
-            .await
-            .expect("inserter write failed");
+    async fn write<R: Into<CompactJsonRow>>(
+        &mut self,
+        partition: i32,
+        offset: i64,
+        log: R,
+    ) -> ImportResult<()> {
+        self.buffer.push(log.into());
 
         debug!(partition, offset, "written log data");
 
         self.record_offset(partition, offset);
 
-        // XXX: Is this pre-commit check even necessary?
-        let time_left = self.inserter.time_left();
-        let should_commit = time_left.map(|t| t.is_zero()).unwrap_or(false);
+        let time_left = self.request_limiter.remaining_time();
 
-        if !should_commit {
+        if !time_left.is_zero() {
             debug!(?time_left, partition, offset, "waiting to commit insert");
             return ImportResult::Pending;
         }
 
-        // XXX: handle retries? although, quite infeasible due to strict rate-limit
-        match self.inserter.commit().await {
-            // TODO: should commit only if q > 0
-            Ok(q) => {
-                info!(partition, rows = q.entries, "inserts committed");
+        let entries = self.buffer.len();
+        debug_assert!(entries > 0, "data loss during write");
+
+        // TODO: metrics (inserted, failed)
+
+        // XXX: std::mem::replace(&mut self.buffer, Vec::with_capacity(self.buffer.len()))
+        let rows = std::mem::take(&mut self.buffer);
+        let input = JsonCompactEachRowInput::new(rows);
+
+        // XXX: handle retries? perhaps just crash & replay or buffer more (strict rate-limit)
+        // XXX: settings?
+        let result = self.ch.insert_with_format(INSERT_DDL, input, None).await;
+        self.request_limiter.record_request();
+
+        match result {
+            Ok(()) => {
+                info!(partition, rows = entries, "inserts committed");
                 // NOTE: commit is done only once in a while so the clone should be fine
                 ImportResult::Success(self.tpl.clone())
             }
@@ -278,6 +380,15 @@ impl ClickHouseSink {
             }
         }
     }
+}
+
+#[instrument(skip(ch))]
+async fn make_table(ch: &clickhouse_http_client::Client, table: &str) {
+    ch.execute(TABLE_DDL, None)
+        .await
+        .expect("making clickhouse table failed");
+
+    info!(table, "made sure log table exists in clickhouse");
 }
 
 /// Create new Kafka consumer and subscribe it to a topic specified in config.
@@ -351,8 +462,8 @@ async fn run_consumer(id: usize, kafka: KafkaConfig, sink: Arc<Mutex<ClickHouseS
                     // sufficient to commit just once after whole batch
 
                     // XXX: consider `CommitMode::Sync` (cons: blocks execution)
-                    // NOTE: since rate-limiting is 1 min, this might be more efficient than frequent
-                    // auto-commit of _stored_ offsets
+                    // NOTE: since rate-limiting is 1 min, this might be more efficient than
+                    // frequent auto-commit of _stored_ offsets
                     consumer
                         .commit(&tpl, CommitMode::Async)
                         // XXX: here we actually should terminate the process
@@ -373,21 +484,7 @@ async fn run_consumer(id: usize, kafka: KafkaConfig, sink: Arc<Mutex<ClickHouseS
     stream_processor.await.expect("stream processing failed");
     warn!("stream processing terminated");
 
-    // TODO: graceful shutdown: terminate inserting
-    //  - `inserter.end().await.expect("inserter shutdown flush failed");`
-    //  - also commit these offsets
-}
-
-// XXX: part of sink?
-#[instrument(skip(ch))]
-async fn make_table(ch: &clickhouse::Client, table: &str) {
-    ch.query(TABLE_DDL)
-        .bind(clickhouse::sql::Identifier(table))
-        .execute()
-        .await
-        .expect("making clickhouse table failed");
-
-    info!(table, "made sure log table exists in clickhouse");
+    // TODO: graceful shutdown: terminate inserting (should we wait till the next insert?)
 }
 
 // TODO: setup shutdown hook & graceful shutdown in general
@@ -407,21 +504,11 @@ async fn main() {
         "starting anonymizer pipeline"
     );
 
-    // XXX: possibly move to `ClickHouseSink::new`
-    let ch = clickhouse::Client::from(&cfg.ch);
-    info!(
-        url = cfg.ch.url,
-        user = cfg.ch.user,
-        "clickhouse client created"
-    );
-
-    // make sure that the log table exists
-    make_table(&ch, &cfg.ch.log_table).await;
-
     let topic = cfg.kafka.topic.clone();
 
     // crete a shared clickhouse sink
-    let sink = Arc::new(Mutex::new(ClickHouseSink::new(topic, cfg.ch, ch)));
+    let sink = ClickHouseSink::new(topic, cfg.ch).await;
+    let sink = Arc::new(Mutex::new(sink));
 
     // spawn a group of Kafka consumers
     (0..cfg.num_consumers)

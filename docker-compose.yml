@@ -138,13 +138,11 @@ services:
   #    - KAFKA__BROKERS=PLAINTEXT://broker:29092
   #    - KAFKA__GROUP_ID
   #    - CH__URL=http://ch-proxy:8124
-  #    #- CH__URL=http://clickhouse-server:8123
   #    - CH__USER
   #    - CH__PASSWORD
   #    - CH__DATABASE
   #    - CH__TCP_KEEPALIVE
-  #    - CH__POOL_IDLE_TIMEOUT
-  #    - CH__LOG_TABLE
+  #    - CH__TARGET_TABLE
   #    - CH__MAX_ENTRIES
   #    - CH__INSERT_PERIOD
   #  depends_on:
