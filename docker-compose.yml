@@ -143,8 +143,10 @@ services:
   #    - CH__DATABASE
   #    - CH__TCP_KEEPALIVE
   #    - CH__TARGET_TABLE
+  #    - CH__CREATE_TABLE
   #    - CH__MAX_ENTRIES
-  #    - CH__INSERT_PERIOD
+  #    - CH__RATE_LIMIT
+  #    - CH__RETRIES
   #  depends_on:
   #    - broker
   #    - ch-proxy
