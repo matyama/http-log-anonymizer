@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::time::Duration;
+use std::{marker::PhantomData, sync::Arc};
 
 use anonymizer::{anonymize_ip, kafka::OffsetTracker, limiter::RequestLimiter};
 use anyhow::{bail, Result};
@@ -137,36 +137,6 @@ impl Config {
     }
 }
 
-// FIXME: hard-coded table identifier
-const TABLE_DDL: &str = "
-      CREATE TABLE IF NOT EXISTS http_log (
-        timestamp DateTime NOT NULL,
-        resource_id UInt64 NOT NULL,
-        bytes_sent UInt64 NOT NULL,
-        request_time_milli UInt64 NOT NULL,
-        response_status UInt16 NOT NULL,
-        cache_status LowCardinality(String) NOT NULL,
-        method LowCardinality(String) NOT NULL,
-        remote_addr String NOT Null,
-        url String NOT NULL
-      )
-      ENGINE = ReplacingMergeTree
-      PARTITION BY toYYYYMM(timestamp)
-      ORDER BY (resource_id, response_status, remote_addr, timestamp)";
-
-const INSERT_DDL: &str = "
-      INSERT INTO http_log (
-          timestamp,
-          resource_id,
-          bytes_sent,
-          request_time_milli,
-          response_status,
-          cache_status,
-          method,
-          remote_addr,
-          url
-      )";
-
 // TODO: ClickHouse works with `&str` or
 //  - https://docs.rs/smartstring/latest/smartstring/struct.SmartString.html
 //  - or possibly https://docs.rs/serde_bytes/latest/serde_bytes/
@@ -262,6 +232,57 @@ impl ConsumerContext for HttpLogConsumerContext {
 
 type HttpLogConsumer = StreamConsumer<HttpLogConsumerContext>;
 
+pub trait SinkRow: Into<CompactJsonRow> {
+    fn table_ddl(table: &str) -> String;
+
+    fn insert_ddl(table: &str) -> String;
+}
+
+// TODO: safety - table name should be properly escaped
+impl SinkRow for HttpLog {
+    #[inline]
+    fn table_ddl(table: &str) -> String {
+        format!(
+            "
+            CREATE TABLE IF NOT EXISTS {} (
+              timestamp DateTime NOT NULL,
+              resource_id UInt64 NOT NULL,
+              bytes_sent UInt64 NOT NULL,
+              request_time_milli UInt64 NOT NULL,
+              response_status UInt16 NOT NULL,
+              cache_status LowCardinality(String) NOT NULL,
+              method LowCardinality(String) NOT NULL,
+              remote_addr String NOT Null,
+              url String NOT NULL
+            )
+            ENGINE = ReplacingMergeTree
+            PARTITION BY toYYYYMM(timestamp)
+            ORDER BY (resource_id, response_status, remote_addr, timestamp)
+            ",
+            table,
+        )
+    }
+
+    #[inline]
+    fn insert_ddl(table: &str) -> String {
+        format!(
+            "
+            INSERT INTO {} (
+              timestamp,
+              resource_id,
+              bytes_sent,
+              request_time_milli,
+              response_status,
+              cache_status,
+              method,
+              remote_addr,
+              url
+            )",
+            table
+        )
+    }
+}
+
 enum ImportResult<E> {
     /// Insert is in progress, buffering the logs
     Pending,
@@ -271,7 +292,7 @@ enum ImportResult<E> {
     Failure(E),
 }
 
-struct ClickHouseSink {
+struct ClickHouseSink<T> {
     /// ClickHouse [`Client`](clickhouse_http_client::Client) for [`HttpLog`]
     ch: clickhouse_http_client::Client,
 
@@ -288,13 +309,17 @@ struct ClickHouseSink {
 
     /// Limiter that keeps track of the maximum allowed request rate for ClickHouse queries.
     request_limiter: RequestLimiter,
+
+    /// Raw insert query header for the target table.
+    insert_ddl: String,
+
+    /// The witness type representing the table schema
+    _t: PhantomData<T>,
 }
 
-impl ClickHouseSink {
+impl<T: SinkRow> ClickHouseSink<T> {
     #[instrument(name = "sink", skip(cfg))]
     async fn new(topic: String, cfg: ClickHouseConfig) -> Self {
-        // TODO: create DDLs from cfg.target_table
-
         let ch = clickhouse_http_client::Client::try_from(&cfg).expect("clickhouse client created");
         info!(url = cfg.url, user = cfg.user, "clickhouse client created");
 
@@ -302,7 +327,7 @@ impl ClickHouseSink {
             // make sure that the target table exists
             let delay = Duration::from_secs(cfg.rate_limit.unwrap_or_default());
             retry(cfg.retries, delay, || async {
-                make_table(&ch, &cfg.target_table).await
+                make_table::<T>(&ch, &cfg.target_table).await
             })
             .await
             // TODO: propagate error
@@ -317,18 +342,15 @@ impl ClickHouseSink {
             buffer: Vec::new(),
             offset_tracker: OffsetTracker::new(topic),
             request_limiter,
+            insert_ddl: T::insert_ddl(&cfg.target_table),
+            _t: PhantomData,
         }
     }
 
     // TODO: proper error type
-    #[instrument(skip(self, log))]
-    async fn write<R: Into<CompactJsonRow>>(
-        &mut self,
-        partition: i32,
-        offset: i64,
-        log: R,
-    ) -> ImportResult<()> {
-        self.buffer.push(log.into());
+    #[instrument(skip(self, data))]
+    async fn write(&mut self, partition: i32, offset: i64, data: T) -> ImportResult<()> {
+        self.buffer.push(data.into());
 
         debug!(partition, offset, "written log data");
 
@@ -352,7 +374,10 @@ impl ClickHouseSink {
 
         // XXX: settings?
         // XXX: retry - the difficulty is that the buffer would have to be copied each time
-        let result = self.ch.insert_with_format(INSERT_DDL, input, None).await;
+        let result = self
+            .ch
+            .insert_with_format(&self.insert_ddl, input, None)
+            .await;
         self.request_limiter.record_request();
 
         match result {
@@ -371,9 +396,12 @@ impl ClickHouseSink {
     }
 }
 
+// XXX: move to SinkRow at the cost of requiring `async_trait`
 #[instrument(skip(ch))]
-async fn make_table(ch: &clickhouse_http_client::Client, table: &str) -> Result<()> {
-    if let Err(e) = ch.execute(TABLE_DDL, None).await {
+async fn make_table<T: SinkRow>(ch: &clickhouse_http_client::Client, table: &str) -> Result<()> {
+    let query = T::table_ddl(table);
+
+    if let Err(e) = ch.execute(query, None).await {
         if let ClickHouseError::ClientExecuteError(ClientExecuteError::StatusCodeMismatch(
             StatusCode::SERVICE_UNAVAILABLE,
         )) = e
@@ -417,7 +445,7 @@ fn create_consumer(cfg: KafkaConfig) -> rdkafka::error::KafkaResult<HttpLogConsu
 
 // XXX: delivery semantics => offset handling & idempotent write
 #[instrument(name = "consumer", skip(kafka, sink))]
-async fn run_consumer(id: usize, kafka: KafkaConfig, sink: Arc<Mutex<ClickHouseSink>>) {
+async fn run_consumer(id: usize, kafka: KafkaConfig, sink: Arc<Mutex<ClickHouseSink<HttpLog>>>) {
     let span = &Span::current();
 
     let consumer = create_consumer(kafka).expect("consumer creation failed");
@@ -505,7 +533,7 @@ async fn main() {
     let topic = cfg.kafka.topic.clone();
 
     // crete a shared clickhouse sink
-    let sink = ClickHouseSink::new(topic, cfg.ch).await;
+    let sink = ClickHouseSink::<HttpLog>::new(topic, cfg.ch).await;
     let sink = Arc::new(Mutex::new(sink));
 
     // spawn a group of Kafka consumers
