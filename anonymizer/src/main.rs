@@ -1,7 +1,7 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use anonymizer::anonymize_ip;
+use anonymizer::{anonymize_ip, limiter::RequestLimiter};
 use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
 use clickhouse_http_client::clickhouse_format::input::JsonCompactEachRowInput;
 use clickhouse_http_client::isahc::prelude::Configurable;
@@ -234,35 +234,6 @@ impl ConsumerContext for HttpLogConsumerContext {
 }
 
 type HttpLogConsumer = StreamConsumer<HttpLogConsumerContext>;
-
-// TODO: extract to lib & test
-struct RequestLimiter {
-    /// The rate with each request can be sent in seconds.
-    request_rate: Duration,
-    /// The timestamp of the last issued request.
-    last_request: Instant,
-}
-
-impl RequestLimiter {
-    #[inline]
-    fn new(request_rate: u64) -> Self {
-        Self {
-            request_rate: Duration::from_secs(request_rate),
-            last_request: Instant::now(),
-        }
-    }
-
-    #[inline]
-    fn remaining_time(&self) -> Duration {
-        self.request_rate
-            .saturating_sub(self.last_request.elapsed())
-    }
-
-    #[inline]
-    fn record_request(&mut self) {
-        self.last_request = Instant::now();
-    }
-}
 
 enum ImportResult<E> {
     /// Insert is in progress, buffering the logs

@@ -1,6 +1,8 @@
 use itertools::Itertools;
 use std::net::IpAddr;
 
+pub mod limiter;
+
 /// Anonymize an IP address by replacing the last octet with 'x'.
 ///
 /// Any non-IP input is returned unchanged.
@@ -23,7 +25,7 @@ pub fn anonymize_ip(ip: String) -> String {
             ip
         }
         IpAddr::V6(ip) => {
-            let mut ip = ip.to_string().split(":").take(8).join(":");
+            let mut ip = ip.to_string().split(':').take(8).join(":");
             ip.push_str(":xxxx");
             ip
         }
