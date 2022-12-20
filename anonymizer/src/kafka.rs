@@ -1,4 +1,24 @@
-use rdkafka::{topic_partition_list::TopicPartitionList, Offset};
+use rdkafka::consumer::{stream_consumer::StreamConsumer, ConsumerContext};
+use rdkafka::error::KafkaResult;
+pub(crate) use rdkafka::topic_partition_list::TopicPartitionList;
+use rdkafka::Offset;
+use tracing::{info, instrument, warn};
+
+pub struct LoggingConsumerContext;
+
+impl rdkafka::client::ClientContext for LoggingConsumerContext {}
+
+impl ConsumerContext for LoggingConsumerContext {
+    #[instrument(name = "commit", skip_all)]
+    fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {
+        match result {
+            Ok(_) => info!(?offsets, "offsets committed successfully"),
+            Err(e) => warn!(cause = ?e, "failed to commit offsets"),
+        };
+    }
+}
+
+pub type LoggingConsumer = StreamConsumer<LoggingConsumerContext>;
 
 // XXX: generalize sink over an OffsetTracker trait (make this struct an instance)
 pub struct OffsetTracker {
