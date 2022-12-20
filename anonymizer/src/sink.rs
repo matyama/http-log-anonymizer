@@ -174,12 +174,13 @@ impl<T> InsertQueue<T> {
 }
 
 pub struct ClickHouseSink<T> {
-    /// ClickHouse [`Client`](clickhouse_http_client::Client) for [`HttpLog`]
+    /// ClickHouse [`Client`](clickhouse_http_client::Client) for
+    /// [`HttpLog`](crate::http_log::HttpLog)
     ch: clickhouse_http_client::Client,
 
     /// Buffered data for the next output (ClickHouse insert)
     ///
-    /// Original [`HttpLog`] data are stored as [`serde_json::Value`](serde_json::Value)s and sent
+    /// Original `HttpLog` data are stored as [`serde_json::Value`](serde_json::Value)s and sent
     /// to ClickHouse as an insert with values in the
     /// [JsonCompactEachRow](https://clickhouse.com/docs/en/interfaces/formats/#jsoncompacteachrow)
     /// format.

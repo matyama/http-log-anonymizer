@@ -25,12 +25,12 @@ pub struct OffsetTracker {
     /// Single Kafka topic that's being consumed
     topic: String,
 
-    /// Offsets of the last written logs for each partition and [topic]
+    /// Offsets of the last written logs for each partition and `topic`
     tpl: TopicPartitionList,
 }
 
 impl OffsetTracker {
-    /// Create new empty tracker for given Kafka [topic].
+    /// Create new empty tracker for given Kafka `topic`.
     pub fn new(topic: String) -> Self {
         Self {
             topic,
