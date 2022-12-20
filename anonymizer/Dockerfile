@@ -1,17 +1,33 @@
 ARG RUST_TAG=1.66-slim
-FROM rust:${RUST_TAG} AS runtime
-
+FROM rust:${RUST_TAG} AS chef 
 RUN apt-get update -qq \
 	&& apt-get install -qq -y --no-install-recommends \
 		capnproto \
 		libcapnp-dev \
-		make \
+        build-essential \
+        openssl \
+        libssl-dev \
+		pkg-config \
 		librdkafka1 \
 		librdkafka-dev \
-		clang \
-		cmake \
 	&& rm -rf /var/lib/apt/lists/*
+RUN cargo install cargo-chef 
+WORKDIR app
 
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare  --recipe-path recipe.json
+
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Build and cache dependencies
+RUN cargo chef cook --release --recipe-path recipe.json
+# Build application
+COPY . .
+RUN cargo build --release --bins
+
+# Build runtime image without the Rust toolchain and additional dependencies
+FROM debian:bullseye-slim AS runtime
 ENV RUST_LOG anonymizer=INFO,librdkafka=WARN
 ENV NUM_CONSUMERS 2
 ENV KAFKA__TOPIC http_log
@@ -29,13 +45,17 @@ ENV CH__CREATE_TABLE true
 ENV CH__MAX_BLOCK_SIZE 4096
 ENV CH__RATE_LIMIT 65
 ENV CH__RETRIES 3
-
 WORKDIR app
-
-COPY . .
-
-RUN cargo build --release --bins
-
-RUN cp /app/target/release/anonymizer /usr/local/bin/
+RUN apt-get update -qq \
+	&& apt-get install -qq -y --no-install-recommends \
+		capnproto \
+		libcapnp-dev \
+		librdkafka1 \
+		librdkafka-dev \
+        libc6 \
+	&& rm -rf /var/lib/apt/lists/*
+COPY --from=builder \
+	/app/target/release/anonymizer \
+	/usr/local/bin/
 CMD anonymizer
 
