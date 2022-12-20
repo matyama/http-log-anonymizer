@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+// XXX: make the limiter anaptive (learn an appropriate request rate from an init setting)
 /// Component responsible for tracking the time since last recorded request and ensuring that it
 /// does not exceed specified limit.
 pub struct RequestLimiter {

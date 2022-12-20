@@ -1,20 +1,27 @@
 use std::time::Duration;
 use std::{marker::PhantomData, sync::Arc};
 
-use anonymizer::{anonymize_ip, kafka::OffsetTracker, limiter::RequestLimiter};
-use anyhow::{bail, Result};
+use anonymizer::{
+    anonymize_ip,
+    error::{async_retry, Error},
+    kafka::OffsetTracker,
+    limiter::RequestLimiter,
+};
+use anyhow::{anyhow, bail, Result};
 use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
 use clickhouse_http_client::clickhouse_format::input::JsonCompactEachRowInput;
 use clickhouse_http_client::error::{ClientExecuteError, Error as ClickHouseError};
 use clickhouse_http_client::isahc::http::StatusCode;
 use clickhouse_http_client::isahc::prelude::Configurable;
 use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt};
 use rdkafka::consumer::CommitMode;
 use rdkafka::consumer::{stream_consumer::StreamConsumer, Consumer, ConsumerContext};
-use rdkafka::error::KafkaResult;
+use rdkafka::error::{KafkaError, KafkaResult, RDKafkaErrorCode};
 use rdkafka::message::{Message, OwnedMessage};
 use rdkafka::topic_partition_list::TopicPartitionList;
+use retry::delay::Fixed;
+use retry::retry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use time::OffsetDateTime;
@@ -29,36 +36,13 @@ pub mod model {
 
 use crate::model::http_log_record;
 
-// XXX: mod error
-#[derive(thiserror::Error, Debug)]
-enum Error {
-    #[error("request rate limit exceeded")]
-    RateLimitted,
-    #[error("ClickHouseError {0:?}")]
-    SinkError(#[from] ClickHouseError),
-}
-
-// TODO: move to lib/error
-async fn retry<T, F, Fut>(mut tries: u64, delay: Duration, f: F) -> Result<T>
-where
-    F: Fn() -> Fut + Send,
-    Fut: Future<Output = Result<T>> + Send,
-{
-    loop {
-        match f().await {
-            e @ Err(_) if tries == 0 => return e,
-            Err(_) => tokio::time::sleep(delay).await,
-            r => return r,
-        }
-        tries -= 1;
-    }
-}
-
 #[derive(Debug, Deserialize, Clone)]
 struct KafkaConfig {
     topic: String,
     brokers: String,
     group_id: String,
+    retries: usize,
+    retry_delay: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -77,7 +61,7 @@ struct ClickHouseConfig {
 }
 
 impl TryFrom<&ClickHouseConfig> for clickhouse_http_client::Client {
-    type Error = ClickHouseError;
+    type Error = Error;
 
     fn try_from(cfg: &ClickHouseConfig) -> Result<Self, Self::Error> {
         let mut builder =
@@ -91,30 +75,30 @@ impl TryFrom<&ClickHouseConfig> for clickhouse_http_client::Client {
                     .tcp_keepalive(Duration::from_secs(cfg.tcp_keepalive))
             });
 
-        builder.set_url(&cfg.url)?;
+        builder
+            .set_url(&cfg.url)
+            .map_err(|_| Error::SinkConfig("url"))?;
 
         let mut ch = builder.build()?;
-        // TODO: propagate errors
-        ch.set_username_to_header(&cfg.user).expect("valid ch user");
+        ch.set_username_to_header(&cfg.user)
+            .map_err(|_| Error::SinkConfig("user"))?;
         ch.set_password_to_header(&cfg.password)
-            .expect("valid ch password");
+            .map_err(|_| Error::SinkConfig("password"))?;
         ch.set_database_to_header(&cfg.database)
-            .expect("valid ch database");
+            .map_err(|_| Error::SinkConfig("database"))?;
 
-        std::result::Result::Ok(ch)
+        Ok(ch)
     }
 }
 
-const DEFAULT_NUM_CONSUMERS: usize = 1;
 #[inline(always)]
-const fn default_num_consumers() -> usize {
-    DEFAULT_NUM_CONSUMERS
+fn default_num_consumers() -> usize {
+    1
 }
 
-const DEFAULT_RUST_LOG: &str = "INFO";
 #[inline(always)]
 fn default_rust_log() -> String {
-    DEFAULT_RUST_LOG.to_string()
+    "INFO".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,17 +113,15 @@ struct Config {
 
 impl Config {
     #[inline]
-    pub fn from_env() -> Result<Self, config::ConfigError> {
+    pub fn from_env() -> Result<Self> {
         config::Config::builder()
             .add_source(config::Environment::default().separator("__"))
             .build()?
             .try_deserialize()
+            .map_err(|e| anyhow!(Error::Config(e)))
     }
 }
 
-// TODO: ClickHouse works with `&str` or
-//  - https://docs.rs/smartstring/latest/smartstring/struct.SmartString.html
-//  - or possibly https://docs.rs/serde_bytes/latest/serde_bytes/
 #[derive(Debug, Serialize)]
 struct HttpLog {
     #[serde(with = "time::serde::timestamp")]
@@ -155,44 +137,33 @@ struct HttpLog {
 }
 
 impl TryFrom<OwnedMessage> for HttpLog {
-    // TODO: thiserror and/or anyhow
-    type Error = ();
+    type Error = capnp::Error;
 
     fn try_from(value: OwnedMessage) -> Result<Self, Self::Error> {
-        let mut buffer = value.payload().expect("failed to get message payload");
+        let mut buffer = value.payload().unwrap_or_default();
 
-        let raw_data = read_message_from_flat_slice(&mut buffer, ReaderOptions::new())
-            .expect("failed to build reader");
+        let raw_data = read_message_from_flat_slice(&mut buffer, ReaderOptions::new())?;
 
-        let data = raw_data
-            .get_root::<http_log_record::Reader<'_>>()
-            .expect("failed to get reader");
+        let data = raw_data.get_root::<http_log_record::Reader<'_>>()?;
 
         let timestamp = OffsetDateTime::from_unix_timestamp_nanos(
             data.get_timestamp_epoch_milli() as i128 * 1_000_000,
         )
-        .expect("invalid timestamp");
+        .map_err(|e| capnp::Error {
+            kind: capnp::ErrorKind::Failed,
+            description: format!("failed to parse 'timestamp_epoch_milli': {}", e),
+        })?;
 
-        let cache_status: &str = data.get_cache_status().expect("failed to get cache status");
-
-        let method: &str = data.get_method().expect("failed to get method");
-
-        let remote_addr: &str = data
-            .get_remote_addr()
-            .expect("failed to get remote address");
-
-        let url: &str = data.get_url().expect("failed to get url");
-
-        std::result::Result::Ok(Self {
+        Ok(Self {
             timestamp,
             resource_id: data.get_resource_id(),
             bytes_sent: data.get_bytes_sent(),
             request_time_milli: data.get_request_time_milli(),
             response_status: data.get_response_status(),
-            cache_status: cache_status.to_owned(),
-            method: method.to_owned(),
-            remote_addr: remote_addr.to_owned(),
-            url: url.to_owned(),
+            cache_status: data.get_cache_status()?.to_owned(),
+            method: data.get_method()?.to_owned(),
+            remote_addr: data.get_remote_addr()?.to_owned(),
+            url: data.get_url()?.to_owned(),
         })
     }
 }
@@ -215,22 +186,6 @@ impl From<HttpLog> for CompactJsonRow {
         ]
     }
 }
-
-struct HttpLogConsumerContext;
-
-impl rdkafka::client::ClientContext for HttpLogConsumerContext {}
-
-impl ConsumerContext for HttpLogConsumerContext {
-    #[instrument(name = "commit", skip_all)]
-    fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {
-        match result {
-            std::result::Result::Ok(_) => info!(?offsets, "offsets committed successfully"),
-            Err(e) => error!(cause = ?e, "failed to commit offsets"),
-        };
-    }
-}
-
-type HttpLogConsumer = StreamConsumer<HttpLogConsumerContext>;
 
 pub trait SinkRow: Into<CompactJsonRow> {
     fn table_ddl(table: &str) -> String;
@@ -319,47 +274,48 @@ struct ClickHouseSink<T> {
 
 impl<T: SinkRow> ClickHouseSink<T> {
     #[instrument(name = "sink", skip(cfg))]
-    async fn new(topic: String, cfg: ClickHouseConfig) -> Self {
-        let ch = clickhouse_http_client::Client::try_from(&cfg).expect("clickhouse client created");
+    async fn new(topic: String, cfg: ClickHouseConfig) -> Result<Self> {
+        let ch = clickhouse_http_client::Client::try_from(&cfg)?;
         info!(url = cfg.url, user = cfg.user, "clickhouse client created");
 
         if cfg.create_table {
             // make sure that the target table exists
             let delay = Duration::from_secs(cfg.rate_limit.unwrap_or_default());
-            retry(cfg.retries, delay, || async {
+            async_retry(cfg.retries, delay, || async {
                 make_table::<T>(&ch, &cfg.target_table).await
             })
-            .await
-            // TODO: propagate error
-            .expect("DDL query failed after retry");
+            .await?;
         }
 
         // XXX: does insert_period have to be an option? => use None to _disable_ rate limit
         let request_limiter = RequestLimiter::new(cfg.rate_limit.unwrap_or(10));
 
-        Self {
+        Ok(Self {
             ch,
             buffer: Vec::new(),
             offset_tracker: OffsetTracker::new(topic),
             request_limiter,
             insert_ddl: T::insert_ddl(&cfg.target_table),
             _t: PhantomData,
-        }
+        })
     }
 
-    // TODO: proper error type
     #[instrument(skip(self, data))]
-    async fn write(&mut self, partition: i32, offset: i64, data: T) -> ImportResult<()> {
+    async fn write(
+        &mut self,
+        partition: i32,
+        offset: i64,
+        data: T,
+    ) -> ImportResult<ClickHouseError> {
         self.buffer.push(data.into());
-
-        debug!(partition, offset, "written log data");
+        debug!("data buffered for insert");
 
         self.offset_tracker.store(partition, offset);
 
         let time_left = self.request_limiter.remaining_time();
 
         if !time_left.is_zero() {
-            debug!(?time_left, partition, offset, "waiting to commit insert");
+            debug!(?time_left, "waiting to commit insert");
             return ImportResult::Pending;
         }
 
@@ -372,25 +328,27 @@ impl<T: SinkRow> ClickHouseSink<T> {
         let rows = std::mem::take(&mut self.buffer);
         let input = JsonCompactEachRowInput::new(rows);
 
+        info!(rows = entries, "inserting batch of data");
+
+        // TODO: handle 413 Payload Too Large
         // XXX: settings?
         // XXX: retry - the difficulty is that the buffer would have to be copied each time
         let result = self
             .ch
             .insert_with_format(&self.insert_ddl, input, None)
             .await;
+
         self.request_limiter.record_request();
 
         match result {
-            std::result::Result::Ok(()) => {
-                info!(partition, rows = entries, "inserts committed");
+            Ok(()) => {
+                info!(rows = entries, "inserts committed");
                 // NOTE: commit is done only once in a while so the clone should be fine
                 ImportResult::Success(self.offset_tracker.load())
             }
             Err(e) => {
-                error!(partition, error = ?e, "insert commit failed: {:?}", e);
-                //error!(partition, error = ?e, "insert commit failed");
-                // panic!();
-                ImportResult::Failure(())
+                warn!(error = ?e, "insert commit failed");
+                ImportResult::Failure(e)
             }
         }
     }
@@ -407,9 +365,9 @@ async fn make_table<T: SinkRow>(ch: &clickhouse_http_client::Client, table: &str
         )) = e
         {
             warn!("cannot execute DDL query in clickhouse at the moment due to rate limit");
-            bail!(Error::RateLimitted);
+            bail!(Error::RateLimit);
         } else {
-            bail!(Error::SinkError(e));
+            bail!(Error::Sink(e));
         };
     };
 
@@ -417,38 +375,58 @@ async fn make_table<T: SinkRow>(ch: &clickhouse_http_client::Client, table: &str
     Ok(())
 }
 
+struct LoggingConsumerContext;
+
+impl rdkafka::client::ClientContext for LoggingConsumerContext {}
+
+impl ConsumerContext for LoggingConsumerContext {
+    #[instrument(name = "commit", skip_all)]
+    fn commit_callback(&self, result: KafkaResult<()>, offsets: &TopicPartitionList) {
+        match result {
+            Ok(_) => info!(?offsets, "offsets committed successfully"),
+            Err(e) => warn!(cause = ?e, "failed to commit offsets"),
+        };
+    }
+}
+
+type LoggingConsumer = StreamConsumer<LoggingConsumerContext>;
+
 /// Create new Kafka consumer and subscribe it to a topic specified in config.
 ///
 /// For configuration options see:
 /// [`librdkafka` docs](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
 #[instrument(name = "create", skip_all)]
-fn create_consumer(cfg: KafkaConfig) -> rdkafka::error::KafkaResult<HttpLogConsumer> {
-    let consumer: HttpLogConsumer = rdkafka::ClientConfig::new()
+fn create_consumer(cfg: KafkaConfig) -> Result<LoggingConsumer> {
+    let consumer: LoggingConsumer = rdkafka::ClientConfig::new()
         .set("group.id", cfg.group_id)
         .set("bootstrap.servers", cfg.brokers)
         .set("enable.partition.eof", "false")
         .set("session.timeout.ms", "6000")
         .set("auto.offset.reset", "latest")
         .set("enable.auto.commit", "false")
-        //.set("enable.auto.commit", "true")
-        //.set("auto.commit.interval.ms", "2000")
         .set("enable.auto.offset.store", "false")
         .set("isolation.level", "read_committed")
         .set("enable.auto.commit", "false")
-        .create_with_context(HttpLogConsumerContext)?;
+        .create_with_context(LoggingConsumerContext)?;
 
     consumer.subscribe(&[&cfg.topic])?;
     info!(topic = cfg.topic, "subscribed new Kafka consumer");
 
-    std::result::Result::Ok(consumer)
+    Ok(consumer)
 }
 
-// XXX: delivery semantics => offset handling & idempotent write
 #[instrument(name = "consumer", skip(kafka, sink))]
-async fn run_consumer(id: usize, kafka: KafkaConfig, sink: Arc<Mutex<ClickHouseSink<HttpLog>>>) {
+async fn run_consumer(
+    id: usize,
+    kafka: KafkaConfig,
+    sink: Arc<Mutex<ClickHouseSink<HttpLog>>>,
+) -> Result<()> {
     let span = &Span::current();
 
-    let consumer = create_consumer(kafka).expect("consumer creation failed");
+    let retries = kafka.retries;
+    let retry_delay = kafka.retry_delay;
+
+    let consumer = create_consumer(kafka)?;
     let consumer = Arc::new(consumer);
 
     let stream_processor = consumer.stream().try_for_each(|msg| {
@@ -465,14 +443,22 @@ async fn run_consumer(id: usize, kafka: KafkaConfig, sink: Arc<Mutex<ClickHouseS
 
             debug!(parent: span, topic, partition, offset, "processing message");
 
-            // TODO: filter out invalid msgs (or rather report them to stats)
-            let mut log = HttpLog::try_from(msg).expect("valid message");
-            debug!(partition, offset, "message parsed");
+            let mut log = match HttpLog::try_from(msg) {
+                Ok(log) => {
+                    debug!(partition, offset, "message parsed");
+                    log
+                }
+                Err(e) => {
+                    // XXX: report invalid to metrics
+                    // NOTE: alternatively one could fail the whole stream processing
+                    warn!(cause = ?e, "ignoring invalid message");
+                    return Ok(());
+                }
+            };
 
             log.remote_addr = anonymize_ip(log.remote_addr);
             debug!(partition, offset, ?log, "anonymized");
 
-            // XXX: consider keeping just single consumer and scale the group horizontally
             let sink_span = debug_span!("sink");
             let result = {
                 // critical write section
@@ -482,42 +468,58 @@ async fn run_consumer(id: usize, kafka: KafkaConfig, sink: Arc<Mutex<ClickHouseS
             };
 
             match result {
-                ImportResult::Pending => {}
+                ImportResult::Pending => {
+                    debug!(topic, partition, offset, "done processing message");
+                    Ok(())
+                }
+
                 ImportResult::Success(tpl) => {
                     // since offsets are sequential and commit retrospective, it should be
                     // sufficient to commit just once after whole batch
 
-                    // XXX: consider `CommitMode::Sync` (cons: blocks execution)
                     // NOTE: since rate-limiting is 1 min, this might be more efficient than
                     // frequent auto-commit of _stored_ offsets
-                    consumer
-                        .commit(&tpl, CommitMode::Async)
-                        // XXX: here we actually should terminate the process
-                        .expect("Kafka offsets committed");
+                    retry(Fixed::from_millis(retry_delay).take(retries), || {
+                        consumer.commit(&tpl, CommitMode::Async)
+                    })
+                    .map_err(|e| {
+                        error!(
+                            cause = ?e,
+                            tries = e.tries,
+                            elapsed = ?e.total_delay,
+                            "failed to commit offsets"
+                        );
+                        e.error
+                    })
                 }
-                ImportResult::Failure(()) => {
-                    //error!(partition, error = ?e, "insert commit failed");
-                    //panic!();
+
+                ImportResult::Failure(e) => {
+                    error!(partition, error = ?e, "insert commit failed");
+                    KafkaResult::Err(KafkaError::MessageConsumption(
+                        RDKafkaErrorCode::Application,
+                    ))
                 }
             }
-
-            debug!(topic, partition, offset, "done processing message");
-            std::result::Result::Ok(())
         }
     });
 
     info!("starting Kafka message stream processing");
-    stream_processor.await.expect("stream processing failed");
+
+    stream_processor
+        .await
+        .map_err(|e| anyhow!(Error::Source(e)))?;
+
     warn!("stream processing terminated");
 
     // TODO: graceful shutdown: terminate inserting (should we wait till the next insert?)
+    Ok(())
 }
 
 // TODO: setup shutdown hook & graceful shutdown in general
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     // read configuration from env
-    let cfg = Config::from_env().expect("configuration from environment");
+    let cfg = Config::from_env()?;
 
     // setup tracing
     tracing_subscriber::registry()
@@ -533,7 +535,7 @@ async fn main() {
     let topic = cfg.kafka.topic.clone();
 
     // crete a shared clickhouse sink
-    let sink = ClickHouseSink::<HttpLog>::new(topic, cfg.ch).await;
+    let sink = ClickHouseSink::<HttpLog>::new(topic, cfg.ch).await?;
     let sink = Arc::new(Mutex::new(sink));
 
     // spawn a group of Kafka consumers
@@ -541,5 +543,7 @@ async fn main() {
         .map(|i| tokio::spawn(run_consumer(i, cfg.kafka.clone(), sink.clone())))
         .collect::<FuturesUnordered<_>>()
         .for_each(|_| async {})
-        .await
+        .await;
+
+    Ok(())
 }

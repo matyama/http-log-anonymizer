@@ -1,6 +1,7 @@
 use itertools::Itertools;
 use std::net::IpAddr;
 
+pub mod error;
 pub mod kafka;
 pub mod limiter;
 
