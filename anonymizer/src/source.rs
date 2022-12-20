@@ -101,6 +101,11 @@ pub async fn run_consumer(
                 }
 
                 ImportResult::Success(tpl) => {
+                    debug_assert!(
+                        tpl.count() > 0,
+                        "successful import must have non-empty offsets"
+                    );
+
                     // since offsets are sequential and commit retrospective, it should be
                     // sufficient to commit just once after whole batch
 

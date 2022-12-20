@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::time::Duration;
 
@@ -45,14 +46,20 @@ impl TryFrom<&ClickHouseConfig> for Client {
     }
 }
 
+/// List of JSON [Value]s.
 pub type CompactJsonRow = Vec<Value>;
 
+/// Typeclass of data that can be written by the [ClickHouseSink].
+///
+/// A type is a [SinkRow] if it provides query template for the schema of the target table and the
+/// insert query header, and if it can be serialied to [CompactJsonRow].
 pub trait SinkRow: Into<CompactJsonRow> {
     fn table_ddl(table: &str) -> String;
 
     fn insert_ddl(table: &str) -> String;
 }
 
+/// Result of a block insert performed by the [ClickHouseSink].
 pub enum ImportResult<E> {
     /// Insert is in progress, buffering the logs
     Pending,
@@ -60,6 +67,110 @@ pub enum ImportResult<E> {
     Success(TopicPartitionList),
     /// Insert has failed with error `E`
     Failure(E),
+}
+
+/// Chunk of data buffered for insert
+struct InsertBlock<T> {
+    /// The block of data to be inserted
+    buffer: Vec<T>,
+    /// Tracker of Kafka offsets corresponding to the last written data
+    tracker: OffsetTracker,
+}
+
+impl<T> InsertBlock<T> {
+    /// Allocate new buffer with given [capacity] and store associated [topic].
+    #[inline]
+    fn new(capacity: usize, topic: String) -> Self {
+        Self {
+            buffer: Vec::with_capacity(capacity),
+            tracker: OffsetTracker::new(topic),
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+/// FIFO queue of [InsertBlock]s of given block size
+struct InsertQueue<T> {
+    /// Non-empy queue of data blocks to insert
+    blocks: VecDeque<InsertBlock<T>>,
+    /// The maximum block size, when reached a new block is allocated to the back of the queue
+    max_block_size: u16,
+    /// Kafka origin topic of the stored data
+    topic: String,
+    /// Total number of entries held by all the blocks
+    entries: usize,
+}
+
+impl<T> InsertQueue<T> {
+    fn new(max_block_size: u16, topic: String) -> Self {
+        debug_assert!(max_block_size > 0, "block size cannot be zero");
+        let mut blocks = VecDeque::new();
+        blocks.push_back(InsertBlock::new(max_block_size as usize, topic.clone()));
+        Self {
+            blocks,
+            max_block_size,
+            topic,
+            entries: 0,
+        }
+    }
+
+    // XXX: use object-pool to reuse blocks and return (buffer, tpl)
+    #[instrument(skip(self))]
+    fn alloc_block(&self) -> InsertBlock<T> {
+        info!(
+            blocks = self.blocks.len() + 1,
+            block_size = self.max_block_size,
+            "allocating new insert block"
+        );
+        InsertBlock::new(self.max_block_size as usize, self.topic.clone())
+    }
+
+    /// Push [value] to the last block in this queue together with its `(partition, offset)` pair.
+    ///
+    /// Allocates new block if the last one is full.
+    #[instrument(name = "insert_queue", skip_all)]
+    fn push(&mut self, partition: i32, offset: i64, value: T) {
+        // SAFETY: pop makes sure that the queue is never empty of blocks
+        let last = self.blocks.back_mut().unwrap();
+        let block = if last.len() < self.max_block_size as usize {
+            last
+        } else {
+            self.blocks.push_back(self.alloc_block());
+            self.blocks.back_mut().unwrap()
+        };
+        block.buffer.push(value);
+        block.tracker.store(partition, offset);
+        self.entries += 1;
+    }
+
+    /// Retrieve and remove the front block in this queue.
+    ///
+    /// Maintains the invariant that the queue must always be non-empty by allocating new block if
+    /// the one returned was the only one in the queue.
+    fn pop(&mut self) -> InsertBlock<T> {
+        // SAFETY: unwrap is sound due to the following check & no other retrieval operation
+        let block = self.blocks.pop_front().unwrap();
+
+        if self.blocks.is_empty() {
+            self.blocks.push_back(self.alloc_block());
+        }
+
+        self.entries -= block.len();
+        block
+    }
+
+    /// Returns the number of entries in the front block of this queue.
+    #[inline]
+    fn front_entries(&self) -> usize {
+        self.blocks
+            .front()
+            .map(InsertBlock::len)
+            .unwrap_or_default()
+    }
 }
 
 pub struct ClickHouseSink<T> {
@@ -72,10 +183,10 @@ pub struct ClickHouseSink<T> {
     /// to ClickHouse as an insert with values in the
     /// [JsonCompactEachRow](https://clickhouse.com/docs/en/interfaces/formats/#jsoncompacteachrow)
     /// format.
-    buffer: Vec<CompactJsonRow>,
-
-    /// Tracker of Kafka offsets corresponding to the last written [`HttpLog`].
-    offset_tracker: OffsetTracker,
+    ///
+    /// Due to import limitations, all buffered data are chunked into an equal-sized blocks and
+    /// sotred in a queue together with their corresponding Kafka offsets.
+    insert_queue: InsertQueue<CompactJsonRow>,
 
     /// Limiter that keeps track of the maximum allowed request rate for ClickHouse queries.
     request_limiter: RequestLimiter,
@@ -107,8 +218,7 @@ impl<T: SinkRow> ClickHouseSink<T> {
 
         Ok(Self {
             ch,
-            buffer: Vec::new(),
-            offset_tracker: OffsetTracker::new(topic),
+            insert_queue: InsertQueue::new(cfg.max_block_size, topic),
             request_limiter,
             insert_ddl: T::insert_ddl(&cfg.target_table),
             _t: PhantomData,
@@ -122,10 +232,8 @@ impl<T: SinkRow> ClickHouseSink<T> {
         offset: i64,
         data: T,
     ) -> ImportResult<ClickHouseError> {
-        self.buffer.push(data.into());
+        self.insert_queue.push(partition, offset, data.into());
         debug!("data buffered for insert");
-
-        self.offset_tracker.store(partition, offset);
 
         let time_left = self.request_limiter.remaining_time();
 
@@ -134,16 +242,21 @@ impl<T: SinkRow> ClickHouseSink<T> {
             return ImportResult::Pending;
         }
 
-        let entries = self.buffer.len();
-        debug_assert!(entries > 0, "data loss during write");
+        let block_entries = self.insert_queue.front_entries();
+        let total_entries = self.insert_queue.entries;
+        debug_assert!(block_entries > 0, "data loss during write");
 
         // TODO: metrics (inserted, failed)
 
-        // XXX: std::mem::replace(&mut self.buffer, Vec::with_capacity(self.buffer.len()))
-        let rows = std::mem::take(&mut self.buffer);
-        let input = JsonCompactEachRowInput::new(rows);
+        let InsertBlock { buffer, tracker } = self.insert_queue.pop();
 
-        info!(rows = entries, "inserting batch of data");
+        let input = JsonCompactEachRowInput::new(buffer);
+
+        info!(
+            block = block_entries,
+            buffered = total_entries,
+            "inserting batch of data"
+        );
 
         // TODO: handle 413 Payload Too Large
         // XXX: retry - the difficulty is that the buffer would have to be copied each time
@@ -156,9 +269,12 @@ impl<T: SinkRow> ClickHouseSink<T> {
 
         match result {
             Ok(()) => {
-                info!(rows = entries, "inserts committed");
-                // NOTE: commit is done only once in a while so the clone should be fine
-                ImportResult::Success(self.offset_tracker.load())
+                info!(
+                    rows = block_entries,
+                    remainig = total_entries - block_entries,
+                    "inserts committed"
+                );
+                ImportResult::Success(tracker.into())
             }
             Err(e) => {
                 warn!(error = ?e, "insert commit failed");
@@ -187,4 +303,56 @@ async fn make_table<T: SinkRow>(ch: &clickhouse_http_client::Client, table: &str
 
     info!(table, "made sure target table exists in clickhouse");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use maplit::hashmap;
+    use rdkafka::Offset;
+
+    use super::*;
+
+    const TOPIC: &str = "topic";
+
+    #[test]
+    fn insert_queue() {
+        let mut q: InsertQueue<u8> = InsertQueue::new(2, TOPIC.to_owned());
+
+        assert_eq!(q.entries, 0);
+        assert_eq!(q.blocks.len(), 1);
+
+        let InsertBlock { buffer, tracker: _ } = q.pop();
+        assert!(buffer.is_empty());
+        assert_eq!(q.blocks.len(), 1);
+
+        q.push(0, 0, 10);
+        q.push(1, 0, 11);
+        q.push(0, 1, 20);
+        assert_eq!(q.entries, 3);
+        assert_eq!(q.blocks.len(), 2);
+        assert_eq!(q.front_entries(), 2);
+
+        let InsertBlock { buffer, tracker } = q.pop();
+        assert_eq!(vec![10, 11], buffer);
+
+        let actual = tracker.load().to_topic_map();
+
+        let expected = hashmap! {
+            (TOPIC.to_owned(), 0) => Offset::Offset(1),
+            (TOPIC.to_owned(), 1) => Offset::Offset(1),
+        };
+
+        assert_eq!(expected, actual);
+
+        assert_eq!(q.entries, 1);
+        assert_eq!(q.blocks.len(), 1);
+        assert_eq!(q.front_entries(), 1);
+
+        let InsertBlock { buffer, tracker: _ } = q.pop();
+        assert_eq!(vec![20], buffer);
+
+        assert_eq!(q.entries, 0);
+        assert_eq!(q.blocks.len(), 1);
+        assert_eq!(q.front_entries(), 0);
+    }
 }

@@ -57,6 +57,13 @@ impl OffsetTracker {
     }
 }
 
+impl From<OffsetTracker> for TopicPartitionList {
+    #[inline]
+    fn from(value: OffsetTracker) -> Self {
+        value.tpl
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

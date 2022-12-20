@@ -21,8 +21,7 @@ pub struct ClickHouseConfig {
     pub tcp_keepalive: u64,
     pub target_table: String,
     pub create_table: bool,
-    #[allow(unused)]
-    pub max_entries: u64,
+    pub max_block_size: u16,
     pub rate_limit: Option<u64>,
     pub retries: u64,
 }

@@ -146,7 +146,7 @@ services:
   #    - CH__TCP_KEEPALIVE
   #    - CH__TARGET_TABLE
   #    - CH__CREATE_TABLE
-  #    - CH__MAX_ENTRIES
+  #    - CH__MAX_BLOCK_SIZE
   #    - CH__RATE_LIMIT
   #    - CH__RETRIES
   #  depends_on:
