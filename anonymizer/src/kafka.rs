@@ -20,15 +20,13 @@ impl OffsetTracker {
 
     /// Save given `(partition, offset)` pair for this tracker's registered topic.
     pub fn store(&mut self, partition: i32, offset: i64) {
-        // XXX: test/assert - write(partition, offset, _) => offset = tpl[partition] + 1
-
         let mut p = match self.tpl.find_partition(&self.topic, partition) {
             Some(p) => p,
             None => self.tpl.add_partition(&self.topic, partition),
         };
 
-        // XXX: offset + 1 (?)
-        p.set_offset(Offset::Offset(offset))
+        // NOTE: 1 plus the offset from the last consumed message according to `commit()` docs
+        p.set_offset(Offset::Offset(offset + 1))
             .expect("Kafka offset update");
     }
 
@@ -57,8 +55,8 @@ mod tests {
         }
 
         let expected = hashmap! {
-            (TOPIC.to_owned(), 0) => Offset::Offset(1),
-            (TOPIC.to_owned(), 1) => Offset::Offset(0),
+            (TOPIC.to_owned(), 0) => Offset::Offset(2),
+            (TOPIC.to_owned(), 1) => Offset::Offset(1),
         };
 
         let actual = tracker.load().to_topic_map();
