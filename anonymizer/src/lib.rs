@@ -89,7 +89,7 @@
 //!     1. After the sink sends an insert block for insert to the underlying ClickHouse client, it
 //!        either responds with an error or the [`TopicPartitionList`](rdkafka::TopicPartitionList)
 //!        for the consumer to commit (which are the last offsets in that particular batch)
-//! 1. The consumer than, and only then, tries to commit the offsets (repeated `KAFKA__RETRIES`
+//! 1. The consumer then, and only then, tries to commit the offsets (repeated `KAFKA__RETRIES`
 //!    times), but only if the insert was successful.
 //!
 //! Therefore upon a restart the consumer will __start from the last committed__ offset and replay
@@ -138,6 +138,15 @@
 //! judged if it really should be dropped. This is probably a job for a dedicated service (with
 //! possible human intervention). In any case, such process will produce essentially new data with
 //! an old _event time_ but with a _new offset_ (needs to be re-inserted into Kafka).
+//!
+//! ### Caveat: commiting Kafka offsets
+//! There are two ways how commit offsets with `librdkafka`
+//!  1. `Sync` - the commit call blocks and waits for an ack from Kafka
+//!  1. `Async` - commit is done asynchronously without waiting.
+//!
+//! Current implementation uses async commits, which can have implication on the delivery
+//! semantics. However, it's an easy change in case the infrastructure is expected to exhibit such
+//! failurs.
 //!
 //! ### Resources
 //! Some resources on the overvriw of "upsert" strategies when using ClickHouse can be found here:
