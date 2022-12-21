@@ -9,7 +9,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use anonymizer::{config::Config, http_log::HttpLog, sink::ClickHouseSink, source::run_consumer};
 
-// TODO: setup shutdown hook & graceful shutdown in general
 #[tokio::main]
 async fn main() -> Result<()> {
     // read configuration from env

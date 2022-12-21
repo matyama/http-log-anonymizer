@@ -1,3 +1,6 @@
+//! This module implements the Kafka source which drives the anonymizer pipeline logic
+//!
+//! TODO
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -33,7 +36,6 @@ fn create_consumer(cfg: KafkaConfig) -> Result<LoggingConsumer> {
         .set("enable.auto.commit", "false")
         .set("enable.auto.offset.store", "false")
         .set("isolation.level", "read_committed")
-        .set("enable.auto.commit", "false")
         .create_with_context(LoggingConsumerContext)?;
 
     consumer.subscribe(&[&cfg.topic])?;
@@ -42,6 +44,12 @@ fn create_consumer(cfg: KafkaConfig) -> Result<LoggingConsumer> {
     Ok(consumer)
 }
 
+/// Run the anonymization pipeline.
+///
+/// This function:
+///  1. Constructs new Kafka consumer and subscribes to a source topic given [`KafkaConfig`]
+///  1. Starts a Kafka message stream processing with the pipeline logic handling each message
+///  1. Commits offsets via the consumer for successfully processed messages
 #[instrument(name = "consumer", skip(kafka, sink))]
 pub async fn run_consumer(
     id: usize,
@@ -143,6 +151,5 @@ pub async fn run_consumer(
 
     warn!("stream processing terminated");
 
-    // TODO: graceful shutdown: terminate inserting (should we wait till the next insert?)
     Ok(())
 }

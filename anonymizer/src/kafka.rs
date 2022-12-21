@@ -1,3 +1,12 @@
+//! This module contains utility components for working with Kafka offsets
+//!
+//! # `LoggingConsumer`
+//! The [`LoggingConsumer`] is simply a [`StreamConsumer`] with custom [`ConsumerContext`] which
+//! adds logging output whenever an offset commit has been attempted by the consumer.
+//!
+//! # `OffsetTracker`
+//! The [`OffsetTracker`] is a component that wraps arond a Kafka topic and a
+//! [`TopicPartitionList`] and provides nicer API to `store` and `load` the last offset.
 use rdkafka::consumer::{stream_consumer::StreamConsumer, ConsumerContext};
 use rdkafka::error::KafkaResult;
 pub(crate) use rdkafka::topic_partition_list::TopicPartitionList;

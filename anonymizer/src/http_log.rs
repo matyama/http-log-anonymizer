@@ -1,3 +1,5 @@
+//! Module with the definition of a [`HttpLog`], its `capnp` representation, and its
+//! implementation of [`SinkRow`].
 use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
 use rdkafka::message::{Message, OwnedMessage};
 use serde::Serialize;

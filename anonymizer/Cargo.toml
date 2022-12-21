@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Martin Matyášek <martin.matyasek@gmail.com>"]
 description = "GDPR-complient Kafka-to-ClickHouse ETL pipeline for HTTP logs"
 repository = "https://github.com/matyama/http-log-anonymizer"
+keywords = ["kafka", "clickhouse", "etl-pipeline", "gdpr"]
 edition = "2021"
 build = "build.rs"
 

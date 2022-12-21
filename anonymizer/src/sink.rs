@@ -1,3 +1,9 @@
+//! This module contains the implementation of the [`ClickHouseSink`].
+//!
+//! TODO
+//!
+//! Note that [`ClickHouseSink`] is generic over the data type and can work with any type which
+//! implements the [`SinkRow`] trait.
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::time::Duration;
@@ -63,7 +69,7 @@ pub trait SinkRow: Into<CompactJsonRow> {
 pub enum ImportResult<E> {
     /// Insert is in progress, buffering the logs
     Pending,
-    /// Inserts have been written and committed, returning last offsets as [`TopicPartitionList`]
+    /// Inserts have been written and committed, returning last offsets as a [`TopicPartitionList`]
     Success(TopicPartitionList),
     /// Insert has failed with error `E`
     Failure(E),

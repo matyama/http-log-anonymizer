@@ -1,3 +1,5 @@
+//! Module that defines a single application-level [`Error`] type and a _retry_ helper function
+//! which is usable in `async` contexts.
 use std::future::Future;
 use std::time::Duration;
 
@@ -23,6 +25,7 @@ pub enum Error {
     RateLimit,
 }
 
+/// Asynchronously runs given future-producing closure `f` `tries`-times with a fixed `delay`.
 pub async fn async_retry<T, F, Fut>(mut tries: u64, delay: Duration, f: F) -> Result<T>
 where
     F: Fn() -> Fut + Send,
