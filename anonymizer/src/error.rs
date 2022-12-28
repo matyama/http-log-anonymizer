@@ -5,22 +5,46 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clickhouse_http_client::error::Error as ClickHouseError;
+use hyper::Error as HyperError;
+use prometheus::Error as PrometheusError;
 use rdkafka::error::KafkaError;
+use tokio_graceful_shutdown::errors::GracefulShutdownError;
 
+/// Generic dynamic error with type erased
+pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Enum encapsulating all the error variants of this crate's components
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    /// Application configuration errors
     #[error("Invalid or missing configuration")]
     Config(#[from] config::ConfigError),
 
+    /// Kafka integration and consumer errors
     #[error("KafkaError {0:?}")]
     Source(#[from] KafkaError),
 
+    /// Configuration errors of [`ClickHouseSink`](crate::sink::ClickHouseSink)
     #[error("Invalid ClickHouse configuration '{0}'")]
     SinkConfig(&'static str),
 
+    /// Pipeline output errors which originated in [`ClickHouseSink`](crate::sink::ClickHouseSink)
     #[error("ClickHouseError {0:?}")]
     Sink(#[from] ClickHouseError),
 
+    /// Errors related to registering, access and manipulation with Prometheus metrics
+    #[error("MetricsError {0:?}")]
+    Metrics(#[from] PrometheusError),
+
+    /// Metrics server errors
+    #[error("Metrics exporter error {0:?}")]
+    MetricsExporter(#[from] HyperError),
+
+    /// Application shutdown errors
+    #[error("Graceful shutdown failed with {0:?}")]
+    ShutdownError(#[from] GracefulShutdownError<BoxedError>),
+
+    /// Pipeline output throttling signal
     #[error("Request rate limit exceeded")]
     RateLimit,
 }

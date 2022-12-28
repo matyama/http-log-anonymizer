@@ -30,6 +30,7 @@ RUN cargo build --release --bins
 FROM debian:bullseye-slim AS runtime
 ENV RUST_LOG anonymizer=INFO,librdkafka=WARN
 ENV NUM_CONSUMERS 2
+ENV SHUTDOWN_TIMEOUT 5
 ENV KAFKA__TOPIC http_log
 ENV KAFKA__BROKERS localhost:9092
 ENV KAFKA__GROUP_ID anonymizer-group
@@ -45,6 +46,7 @@ ENV CH__CREATE_TABLE true
 ENV CH__MAX_BLOCK_SIZE 4096
 ENV CH__RATE_LIMIT 65
 ENV CH__RETRIES 3
+ENV TELEMETRY__PROMETHEUS_EXPORTER_PORT 9464
 WORKDIR app
 RUN apt-get update -qq \
 	&& apt-get install -qq -y --no-install-recommends \
@@ -57,5 +59,5 @@ RUN apt-get update -qq \
 COPY --from=builder \
 	/app/target/release/anonymizer \
 	/usr/local/bin/
-CMD anonymizer
+CMD ["anonymizer"]
 

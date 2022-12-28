@@ -4,14 +4,18 @@
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
+use derive_new::new;
 use futures::TryStreamExt;
+use prometheus_metric_storage::StorageRegistry;
 use rdkafka::consumer::CommitMode;
 use rdkafka::consumer::Consumer;
 use rdkafka::error::{KafkaError, KafkaResult, RDKafkaErrorCode};
 use rdkafka::message::Message;
 use retry::delay::Fixed;
 use retry::retry;
+use stream_cancel::Valve;
 use tokio::sync::Mutex;
+use tokio_graceful_shutdown::SubsystemHandle;
 use tracing::{debug, debug_span, error, info, instrument, warn, Span};
 
 use crate::anonymize_ip;
@@ -20,6 +24,7 @@ use crate::error::Error;
 use crate::http_log::HttpLog;
 use crate::kafka::{LoggingConsumer, LoggingConsumerContext};
 use crate::sink::{ClickHouseSink, ImportResult};
+use crate::telemetry::Metrics;
 
 /// Create new Kafka consumer and subscribe it to a topic specified in config.
 ///
@@ -44,17 +49,19 @@ fn create_consumer(cfg: KafkaConfig) -> Result<LoggingConsumer> {
     Ok(consumer)
 }
 
+// XXX: generalize to `ClickHouseSink<O> where I: TryFrom<OwnedMessge> + Transform<I, O>, O: ...`
 /// Run the anonymization pipeline.
 ///
 /// This function:
 ///  1. Constructs new Kafka consumer and subscribes to a source topic given [`KafkaConfig`]
 ///  1. Starts a Kafka message stream processing with the pipeline logic handling each message
 ///  1. Commits offsets via the consumer for successfully processed messages
-#[instrument(name = "consumer", skip(kafka, sink))]
+#[instrument(name = "pipeline", skip_all)]
 pub async fn run_consumer(
-    id: usize,
     kafka: KafkaConfig,
     sink: Arc<Mutex<ClickHouseSink<HttpLog>>>,
+    metrics: Metrics,
+    valve: Valve,
 ) -> Result<()> {
     let span = &Span::current();
 
@@ -64,11 +71,23 @@ pub async fn run_consumer(
     let consumer = create_consumer(kafka)?;
     let consumer = Arc::new(consumer);
 
-    let stream_processor = consumer.stream().try_for_each(|msg| {
+    let msg_stream = valve.wrap(consumer.stream());
+
+    let stream_processor = msg_stream.try_for_each(|msg| {
         let consumer = consumer.clone();
         let sink = sink.clone();
+        let metrics = metrics.clone();
 
         async move {
+            let timer = metrics.message_latency_seconds.start_timer();
+
+            metrics
+                .messages_total
+                .with_label_values(&["received"])
+                .inc();
+
+            metrics.message_payload_bytes.set(msg.payload_len() as f64);
+
             // process a message
             let msg = msg.detach();
 
@@ -84,13 +103,18 @@ pub async fn run_consumer(
                     log
                 }
                 Err(e) => {
-                    // XXX: report invalid to metrics
-                    // NOTE: alternatively one could fail the whole stream processing
                     warn!(cause = ?e, "ignoring invalid message");
+                    metrics
+                        .messages_total
+                        .with_label_values(&["rejected"])
+                        .inc();
+                    timer.observe_duration();
                     return Ok(());
                 }
             };
 
+            // TODO: enum AnonymizeResult { Changed(String), Unchanged(String) }
+            //  - or just std::result::Result<String, String>
             log.remote_addr = anonymize_ip(log.remote_addr);
             debug!(partition, offset, ?log, "anonymized");
 
@@ -102,7 +126,7 @@ pub async fn run_consumer(
                 sink.write(partition, offset, log).await
             };
 
-            match result {
+            let result = match result {
                 ImportResult::Pending => {
                     debug!(topic, partition, offset, "done processing message");
                     Ok(())
@@ -139,7 +163,15 @@ pub async fn run_consumer(
                         RDKafkaErrorCode::Application,
                     ))
                 }
-            }
+            };
+
+            metrics
+                .messages_total
+                .with_label_values(&["processed"])
+                .inc();
+            timer.observe_duration();
+
+            result
         }
     });
 
@@ -152,4 +184,79 @@ pub async fn run_consumer(
     warn!("stream processing terminated");
 
     Ok(())
+}
+
+#[derive(new)]
+struct KafkaConsumer {
+    id: usize,
+    kafka: KafkaConfig,
+    sink: Arc<Mutex<ClickHouseSink<HttpLog>>>,
+    metrics: Metrics,
+    valve: Valve,
+}
+
+// TODO: merge with `run_consumer`
+impl KafkaConsumer {
+    #[inline]
+    fn subsys_name(&self) -> String {
+        format!("KafkaConsumer-{}", self.id)
+    }
+
+    #[instrument(name = "consumer", fields(id = self.id, topic = self.kafka.topic), skip_all)]
+    async fn run(self, subsys: SubsystemHandle) -> Result<()> {
+        if let Err(e) = run_consumer(self.kafka, self.sink, self.metrics, self.valve).await {
+            error!(cause = ?e, "stream processing failed, initiating shutdown");
+            subsys.request_global_shutdown();
+        }
+
+        Ok(())
+    }
+}
+
+// TODO: generalize over `HttpLog`
+/// Top-level pipeline subsystem compositor and driver
+#[derive(new)]
+pub struct KafkaSource {
+    num_consumers: usize,
+    kafka: KafkaConfig,
+    sink: Arc<Mutex<ClickHouseSink<HttpLog>>>,
+    registry: StorageRegistry,
+}
+
+impl KafkaSource {
+    #[instrument(name = "source", fields(topic = self.kafka.topic), skip_all)]
+    pub async fn run(self, subsys: SubsystemHandle) -> Result<()> {
+        info!("starting stream processing");
+
+        // NOTE: when `exit` is dropped, all consumer Kafka streams will be interruped
+        let (exit, valve) = Valve::new();
+
+        // XXX: additional consumer-specific metrics (`labels("consumer")`)
+        let metrics = Metrics::get_or_create(&self.registry)?;
+
+        let consumers = (0..self.num_consumers).map(|id| {
+            KafkaConsumer::new(
+                id,
+                self.kafka.clone(),
+                self.sink.clone(),
+                metrics.clone(),
+                valve.clone(),
+            )
+        });
+
+        // run consumer subsystems
+        for consumer in consumers {
+            subsys.start(consumer.subsys_name().as_str(), |subsys| {
+                consumer.run(subsys)
+            });
+        }
+
+        // wait to gracefully shut down
+        subsys.on_shutdown_requested().await;
+
+        warn!("shutting down stream processing");
+        drop(exit);
+
+        Ok(())
+    }
 }

@@ -48,17 +48,36 @@
 //! export CH__RETRIES=3
 //! ```
 //!
+//! # Telemetry
+//! The [`TelemetryConfig`] structure is defined by (and loaded from) the following set of
+//! environment variables:
+//!  - `TELEMETRY__PROMETHEUS_EXPORTER_PORT` is the port that the metrics server will listen to for
+//!    Prometheus metrics scraping requests
+//!
+//! ## Example setup
+//! ```bash
+//! export TELEMETRY__PROMETHEUS_EXPORTER_PORT=9464
+//! ```
+//!
+//! ## Caveat: native binary
+//! Note that when executed as a native binary, the server will run on the host network, so the
+//! Prometheus integration will only work as long as the Prometheus instance also runs in, or has
+//! access to, the host network.
+//!
 //! # Anonymizer
 //! The [`Config`] structure represents the whole application configuration, includes both the
 //! [`KafkaConfig`] and [`ClickHouseConfig`], and additionally is defined by (and loaded from) the
 //! following set of environment variables:
 //!  - `RUST_LOG` is the standard Rust log configuration string
 //!  - `NUM_CONSUMERS` is the number of consumer tasks that will be spawned in the Tokio runtime
+//!  - `SHUTDOWN_TIMEOUT` is the time in seconds for how long will the application wait for its
+//!    subsystems to gracefully shut down
 //!
 //! # Example setup
 //! ```bash
 //! export RUST_LOG=anonymizer=INFO,librdkafka=WARN
 //! export NUM_CONSUMERS=2
+//! export SHUTDOWN_TIMEOUT=5
 //! ```
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -88,6 +107,11 @@ pub struct ClickHouseConfig {
     pub retries: u64,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TelemetryConfig {
+    pub prometheus_exporter_port: u16,
+}
+
 #[inline(always)]
 fn default_num_consumers() -> usize {
     1
@@ -100,12 +124,25 @@ fn default_rust_log() -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// Number of Kafka consumers to start for the message ingest (default: 1)
     #[serde(default = "default_num_consumers")]
     pub num_consumers: usize,
+
+    /// Time in seconds of the graceful shutdown period
+    pub shutdown_timeout: u64,
+
+    /// Component log levels as the standard `RUST_LOG` configuration string (default: `INFO`)
     #[serde(default = "default_rust_log")]
     pub rust_log: String,
+
+    /// Kafka integration configs
     pub kafka: KafkaConfig,
+
+    /// ClickHouse integration configs
     pub ch: ClickHouseConfig,
+
+    /// Configirations for metrics, tracing and logging
+    pub telemetry: TelemetryConfig,
 }
 
 impl Config {

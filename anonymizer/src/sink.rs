@@ -14,6 +14,7 @@ use clickhouse_http_client::error::{ClientExecuteError, Error as ClickHouseError
 use clickhouse_http_client::isahc::http::StatusCode;
 use clickhouse_http_client::isahc::prelude::Configurable;
 use clickhouse_http_client::{Client, ClientBuilder};
+use prometheus_metric_storage::StorageRegistry;
 use serde_json::Value;
 use tracing::{debug, info, instrument, warn};
 
@@ -21,6 +22,7 @@ use crate::config::ClickHouseConfig;
 use crate::error::{async_retry, Error};
 use crate::kafka::{OffsetTracker, TopicPartitionList};
 use crate::limiter::RequestLimiter;
+use crate::telemetry::Metrics;
 
 impl TryFrom<&ClickHouseConfig> for Client {
     type Error = Error;
@@ -201,13 +203,20 @@ pub struct ClickHouseSink<T> {
     /// Raw insert query header for the target table.
     insert_ddl: String,
 
+    /// Collectors of application metrics
+    metrics: Metrics,
+
     /// The witness type representing the table schema
     _t: PhantomData<T>,
 }
 
 impl<T: SinkRow> ClickHouseSink<T> {
     #[instrument(name = "sink", skip(cfg))]
-    pub async fn new(topic: String, cfg: ClickHouseConfig) -> Result<Self> {
+    pub async fn new(
+        topic: String,
+        cfg: ClickHouseConfig,
+        registry: &StorageRegistry,
+    ) -> Result<Self> {
         let ch = clickhouse_http_client::Client::try_from(&cfg)?;
         info!(url = cfg.url, user = cfg.user, "clickhouse client created");
 
@@ -223,11 +232,14 @@ impl<T: SinkRow> ClickHouseSink<T> {
         // XXX: does insert_period have to be an option? => use None to _disable_ rate limit
         let request_limiter = RequestLimiter::new(cfg.rate_limit.unwrap_or(10));
 
+        let metrics = Metrics::get_or_create(registry)?;
+
         Ok(Self {
             ch,
             insert_queue: InsertQueue::new(cfg.max_block_size, topic),
             request_limiter,
             insert_ddl: T::insert_ddl(&cfg.target_table),
+            metrics: metrics.clone(),
             _t: PhantomData,
         })
     }
@@ -239,21 +251,38 @@ impl<T: SinkRow> ClickHouseSink<T> {
         offset: i64,
         data: T,
     ) -> ImportResult<ClickHouseError> {
+        let timer = self.metrics.output_duration_seconds.start_timer();
+
         self.insert_queue.push(partition, offset, data.into());
         debug!("data buffered for insert");
+
+        let queued_blocks = self.insert_queue.blocks.len();
+        let block_entries = self.insert_queue.front_entries();
+        let total_entries = self.insert_queue.entries;
+        debug_assert!(block_entries > 0, "data loss during write");
+
+        self.metrics.output_queued_blocks.set(queued_blocks as i64);
+
+        self.metrics
+            .output_entries
+            .with_label_values(&["buffered"])
+            .set(total_entries as i64);
+
+        let block_percent = block_entries as f64 / self.insert_queue.max_block_size as f64;
+        self.metrics.output_insert_block_percent.set(block_percent);
 
         let time_left = self.request_limiter.remaining_time();
 
         if !time_left.is_zero() {
             debug!(?time_left, "waiting to commit insert");
+            timer.observe_duration();
             return ImportResult::Pending;
         }
 
-        let block_entries = self.insert_queue.front_entries();
-        let total_entries = self.insert_queue.entries;
-        debug_assert!(block_entries > 0, "data loss during write");
-
-        // TODO: metrics (inserted, failed)
+        self.metrics
+            .output_entries
+            .with_label_values(&["insert"])
+            .set(block_entries as i64);
 
         let InsertBlock { buffer, tracker } = self.insert_queue.pop();
 
@@ -274,6 +303,8 @@ impl<T: SinkRow> ClickHouseSink<T> {
 
         self.request_limiter.record_request();
 
+        timer.observe_duration();
+
         match result {
             Ok(()) => {
                 info!(
@@ -281,6 +312,11 @@ impl<T: SinkRow> ClickHouseSink<T> {
                     remainig = total_entries - block_entries,
                     "inserts committed"
                 );
+
+                self.metrics
+                    .output_inserted_total
+                    .inc_by(block_entries as u64);
+
                 ImportResult::Success(tracker.into())
             }
             Err(e) => {

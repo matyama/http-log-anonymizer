@@ -27,3 +27,8 @@ scrape_configs:
 
     static_configs:
     - targets: ['jmx-kafka:5556']
+
+  - job_name: 'anonymizer'
+
+    static_configs:
+      - targets: ['log-anonymizer:9464']
