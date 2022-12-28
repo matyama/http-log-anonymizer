@@ -129,28 +129,32 @@ services:
       - broker
     container_name: log-producer
 
-  #anonymizer:
-  #  build: anonymizer
-  #  environment:
-  #    - RUST_LOG
-  #    - NUM_CONSUMERS=1
-  #    - KAFKA__TOPIC
-  #    - KAFKA__BROKERS=PLAINTEXT://broker:29092
-  #    - KAFKA__GROUP_ID
-  #    - KAFKA__RETRIES
-  #    - KAFKA__RETRY_DELAY
-  #    - CH__URL=http://ch-proxy:8124
-  #    - CH__USER
-  #    - CH__PASSWORD
-  #    - CH__DATABASE
-  #    - CH__TCP_KEEPALIVE
-  #    - CH__TARGET_TABLE
-  #    - CH__CREATE_TABLE
-  #    - CH__MAX_BLOCK_SIZE
-  #    - CH__RATE_LIMIT
-  #    - CH__RETRIES
-  #  depends_on:
-  #    - broker
-  #    - ch-proxy
-  #  container_name: log-anonymizer
+  anonymizer:
+    build: anonymizer
+    ports:
+      - "${TELEMETRY__PROMETHEUS_EXPORTER_PORT}:${TELEMETRY__PROMETHEUS_EXPORTER_PORT}"
+    environment:
+      - RUST_LOG
+      - NUM_CONSUMERS=1
+      - SHUTDOWN_TIMEOUT
+      - KAFKA__TOPIC
+      - KAFKA__BROKERS=PLAINTEXT://broker:29092
+      - KAFKA__GROUP_ID
+      - KAFKA__RETRIES
+      - KAFKA__RETRY_DELAY
+      - CH__URL=http://ch-proxy:8124
+      - CH__USER
+      - CH__PASSWORD
+      - CH__DATABASE
+      - CH__TCP_KEEPALIVE
+      - CH__TARGET_TABLE
+      - CH__CREATE_TABLE
+      - CH__MAX_BLOCK_SIZE
+      - CH__RATE_LIMIT
+      - CH__RETRIES
+      - TELEMETRY__PROMETHEUS_EXPORTER_PORT
+    depends_on:
+      - broker
+      - ch-proxy
+    container_name: log-anonymizer
 

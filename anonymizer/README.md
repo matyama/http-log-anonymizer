@@ -209,6 +209,7 @@ Here is a list with the notable dependencies that are essential to the anonymize
  - [Cap'n Proto for Rust](https://github.com/capnproto/capnproto-rust)
  - [`librdkafka` for Rust](https://github.com/fede1024/rust-rdkafka)
  - [ClickHouse HTTP client](https://crates.io/crates/clickhouse-http-client)
+ - [`Hyper`-based exporter of Prometheus metrics](https://crates.io/crates/prometheus-hyper)
 
 And to make the implementation more sane this crate also depends on:
  - [`config`](https://crates.io/crates/config) for env-based configuration
@@ -216,6 +217,9 @@ And to make the implementation more sane this crate also depends on:
    [`anyhow`](https://crates.io/crates/anyhow) for better error handling and propagation
  - [Tokio `tracing`](https://github.com/tokio-rs/tracing) for tracing (and logging) in async
    contexts
+ - [Tokio graceful shutdown](https://crates.io/crates/tokio-graceful-shutdown) for
+   orchestrating the application
+ - [`stream-cancel`](https://crates.io/crates/stream-cancel) for stram interruption
 
 ### Known issues & limitations
  - There could be a better separation of the Kafka message ingestion & application logic of the
@@ -232,12 +236,12 @@ And to make the implementation more sane this crate also depends on:
    insert. Therefore it's not currently possible to send compressed data which would allow us
    to increase the insert block size (`CH__MAX_BLOCK_SIZE`) and lower the data latencies for a
    large input batch accumulated in Kafka (i.e. when last committed offset is quite old).
- - The [`source`](source) code generally does not deal with a _graceful shutdown_ and only
+ - ~~The [`source`](source) code generally does not deal with a _graceful shutdown_ and only
    tries to propagate and log meaningful messages. The reason this is not yet supported is
    because it's no straightforwart how the shutdown should behave. Should it for example wait
    till the next insert block finishes? It could be quite a long time depending on
    `CH__RATE_LIMITa`. Or should it iterrupt the insert? But in that case consumers won't commit
-   offsets to Kafka, which essentially defeats the purpose of a _graceful_ shutdown.
+   offsets to Kafka, which essentially defeats the purpose of a _graceful_ shutdown.~~
  - Sink does not retry block inserts (as it does for the create table query). This is for two
    reasons:
     1. It could singnificantly slow down the processing (inside a critical section) depending
@@ -245,7 +249,7 @@ And to make the implementation more sane this crate also depends on:
     1. It would require a (potentially expensive) complete buffer clone because the underlying
        [`clickhouse_http_client::Client`] takes the ownership of the batch being inserted.
  - Currently there is no mechanism for _backpressure_ from the sink to the Kafka consumers
- - Collecting performace metrics is not yet implemented (although this shouldn't be hard)
+ - ~~Collecting performace metrics is not yet implemented (although this shouldn't be hard)~~
  - Generally way more integration and unit tests would be necessary for this to make it into a
    production-ready state
 
