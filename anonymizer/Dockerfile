@@ -47,6 +47,7 @@ ENV CH__MAX_BLOCK_SIZE 4096
 ENV CH__RATE_LIMIT 65
 ENV CH__RETRIES 3
 ENV TELEMETRY__PROMETHEUS_EXPORTER_PORT 9464
+ENV TELEMETRY__LOKI_URL http://localhost:3100
 WORKDIR app
 RUN apt-get update -qq \
 	&& apt-get install -qq -y --no-install-recommends \

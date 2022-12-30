@@ -53,10 +53,12 @@
 //! environment variables:
 //!  - `TELEMETRY__PROMETHEUS_EXPORTER_PORT` is the port that the metrics server will listen to for
 //!    Prometheus metrics scraping requests
+//!  - `TELEMETRY__LOKI_URL` is the URL of the Grafana Loki instance to publish logs/traces to
 //!
 //! ## Example setup
 //! ```bash
 //! export TELEMETRY__PROMETHEUS_EXPORTER_PORT=9464
+//! export TELEMETRY__LOKI_URL="http://localhost:3100"
 //! ```
 //!
 //! ## Caveat: native binary
@@ -81,6 +83,7 @@
 //! ```
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use url::Url;
 
 use crate::error::Error;
 
@@ -110,6 +113,7 @@ pub struct ClickHouseConfig {
 #[derive(Debug, Deserialize)]
 pub struct TelemetryConfig {
     pub prometheus_exporter_port: u16,
+    pub loki_url: Url,
 }
 
 #[inline(always)]

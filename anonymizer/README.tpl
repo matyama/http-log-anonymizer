@@ -1,4 +1,5 @@
-# `{{crate}}:{{version}}`
+# {{crate}}
+![Version: {{version}}](https://img.shields.io/badge/version-{{version}}-blue)
 
 ## Environment
 The application expects certain set of environment variables (described below). A working

@@ -1,4 +1,5 @@
-# `anonymizer:0.1.0`
+# anonymizer
+![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue)
 
 ## Environment
 The application expects certain set of environment variables (described below). A working
@@ -217,6 +218,8 @@ And to make the implementation more sane this crate also depends on:
    [`anyhow`](https://crates.io/crates/anyhow) for better error handling and propagation
  - [Tokio `tracing`](https://github.com/tokio-rs/tracing) for tracing (and logging) in async
    contexts
+ - [`tracking-loki`](https://crates.io/crates/tracing-loki) for publishing `tracing` logs to
+   Grafana Loki
  - [Tokio graceful shutdown](https://crates.io/crates/tokio-graceful-shutdown) for
    orchestrating the application
  - [`stream-cancel`](https://crates.io/crates/stream-cancel) for stram interruption
