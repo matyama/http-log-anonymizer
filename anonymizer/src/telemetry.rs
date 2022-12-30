@@ -9,8 +9,10 @@ use derive_new::new;
 use prometheus::{Gauge, Histogram, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Registry};
 use prometheus_hyper::Server;
 use prometheus_metric_storage::{MetricStorage, StorageRegistry};
+use tokio::task::JoinHandle;
 use tokio_graceful_shutdown::SubsystemHandle;
 use tracing::{info, instrument, warn};
+use tracing_loki::BackgroundTask;
 
 use crate::error::Error;
 
@@ -81,5 +83,32 @@ impl MetricsExporter {
         )
         .await
         .map_err(|e| anyhow!(Error::MetricsExporter(e)))
+    }
+}
+
+/// Publisher of tracing logs to Grafana Loki.
+///
+/// Wraps a `tokio` task [handle](tokio::task::JoinHandle) of a spawned
+/// [`BackgroundTask`](tracing_loki::BackgroundTask).
+pub struct TracingExporter {
+    handle: JoinHandle<()>,
+}
+
+impl TracingExporter {
+    /// Spawns given `task` and stores its handle to abort it during graceful shutdown
+    pub fn spawn(task: BackgroundTask) -> Self {
+        Self {
+            handle: tokio::spawn(task),
+        }
+    }
+
+    #[instrument(name = "loki", skip_all)]
+    pub async fn run(self, subsys: SubsystemHandle) -> Result<()> {
+        subsys.on_shutdown_requested().await;
+
+        warn!("shutting down log publisher");
+        self.handle.abort();
+
+        Ok(())
     }
 }

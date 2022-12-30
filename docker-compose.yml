@@ -59,7 +59,19 @@ services:
      - ./grafana/dashboards:/var/lib/grafana/dashboards
     container_name: grafana
     depends_on:
+     - loki
      - prometheus
+
+  loki:
+    image: "grafana/loki:2.6.1"
+    ports:
+      - "3100:3100"
+      - "9093:9093"
+      - "9096:9096"
+    volumes:
+     - ./etc/loki/local-config.yml:/etc/loki/local-config.yml
+    command: "-config.file=/etc/loki/local-config.yaml"
+    container_name: loki
 
   prometheus:
     image: "prom/prometheus:v2.34.0"
@@ -153,8 +165,10 @@ services:
       - CH__RATE_LIMIT
       - CH__RETRIES
       - TELEMETRY__PROMETHEUS_EXPORTER_PORT
+      - TELEMETRY__LOKI_URL=http://loki:3100
     depends_on:
       - broker
       - ch-proxy
+      - loki
     container_name: log-anonymizer
 

@@ -182,6 +182,8 @@
 //!    [`anyhow`](https://crates.io/crates/anyhow) for better error handling and propagation
 //!  - [Tokio `tracing`](https://github.com/tokio-rs/tracing) for tracing (and logging) in async
 //!    contexts
+//!  - [`tracking-loki`](https://crates.io/crates/tracing-loki) for publishing `tracing` logs to
+//!    Grafana Loki
 //!  - [Tokio graceful shutdown](https://crates.io/crates/tokio-graceful-shutdown) for
 //!    orchestrating the application
 //!  - [`stream-cancel`](https://crates.io/crates/stream-cancel) for stram interruption
