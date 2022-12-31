@@ -5,6 +5,7 @@
 //! Note that [`ClickHouseSink`] is generic over the data type and can work with any type which
 //! implements the [`SinkRow`] trait.
 use std::collections::VecDeque;
+use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::time::Duration;
 
@@ -14,9 +15,12 @@ use clickhouse_http_client::error::{ClientExecuteError, Error as ClickHouseError
 use clickhouse_http_client::isahc::http::StatusCode;
 use clickhouse_http_client::isahc::prelude::Configurable;
 use clickhouse_http_client::{Client, ClientBuilder};
+use derive_new::new;
 use prometheus_metric_storage::StorageRegistry;
 use serde_json::Value;
-use tracing::{debug, info, instrument, warn};
+use tokio::sync::{mpsc, oneshot};
+use tokio_graceful_shutdown::SubsystemHandle;
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::config::ClickHouseConfig;
 use crate::error::{async_retry, Error};
@@ -67,8 +71,18 @@ pub trait SinkRow: Into<CompactJsonRow> {
     fn insert_ddl(table: &str) -> String;
 }
 
+/// Request to insert data of type `T` into ClickHouse
+#[derive(Debug, new)]
+pub struct Insert<T, E> {
+    partition: i32,
+    offset: i64,
+    data: T,
+    reply: oneshot::Sender<InsertResult<E>>,
+}
+
 /// Result of a block insert performed by the [ClickHouseSink].
-pub enum ImportResult<E> {
+#[derive(Debug)]
+pub enum InsertResult<E> {
     /// Insert is in progress, buffering the logs
     Pending,
     /// Inserts have been written and committed, returning last offsets as a [`TopicPartitionList`]
@@ -179,9 +193,18 @@ impl<T> InsertQueue<T> {
             .map(InsertBlock::len)
             .unwrap_or_default()
     }
+
+    #[inline]
+    fn reinstall_offsets(&mut self, tpl: TopicPartitionList) {
+        // SAFETY: pop makes sure that the queue is never empty of blocks
+        self.blocks.front_mut().unwrap().tracker.insert(tpl)
+    }
 }
 
-pub struct ClickHouseSink<T> {
+pub struct ClickHouseSink<T, E> {
+    /// Receiver end of an [`Insert`] request channel from multiple data sources.
+    source: mpsc::Receiver<Insert<T, E>>,
+
     /// ClickHouse [`Client`](clickhouse_http_client::Client) for
     /// [`HttpLog`](crate::http_log::HttpLog)
     ch: clickhouse_http_client::Client,
@@ -210,11 +233,16 @@ pub struct ClickHouseSink<T> {
     _t: PhantomData<T>,
 }
 
-impl<T: SinkRow> ClickHouseSink<T> {
-    #[instrument(name = "sink", skip(cfg))]
+impl<T, E> ClickHouseSink<T, E>
+where
+    T: SinkRow,
+    E: Debug + From<ClickHouseError>,
+{
+    #[instrument(name = "sink", skip(cfg, source, registry))]
     pub async fn new(
         topic: String,
         cfg: ClickHouseConfig,
+        source: mpsc::Receiver<Insert<T, E>>,
         registry: &StorageRegistry,
     ) -> Result<Self> {
         let ch = clickhouse_http_client::Client::try_from(&cfg)?;
@@ -235,6 +263,7 @@ impl<T: SinkRow> ClickHouseSink<T> {
         let metrics = Metrics::get_or_create(registry)?;
 
         Ok(Self {
+            source,
             ch,
             insert_queue: InsertQueue::new(cfg.max_block_size, topic),
             request_limiter,
@@ -245,12 +274,7 @@ impl<T: SinkRow> ClickHouseSink<T> {
     }
 
     #[instrument(skip(self, data))]
-    pub async fn write(
-        &mut self,
-        partition: i32,
-        offset: i64,
-        data: T,
-    ) -> ImportResult<ClickHouseError> {
+    pub async fn write(&mut self, partition: i32, offset: i64, data: T) -> InsertResult<E> {
         let timer = self.metrics.output_duration_seconds.start_timer();
 
         self.insert_queue.push(partition, offset, data.into());
@@ -276,7 +300,7 @@ impl<T: SinkRow> ClickHouseSink<T> {
         if !time_left.is_zero() {
             debug!(?time_left, "waiting to commit insert");
             timer.observe_duration();
-            return ImportResult::Pending;
+            return InsertResult::Pending;
         }
 
         self.metrics
@@ -317,13 +341,53 @@ impl<T: SinkRow> ClickHouseSink<T> {
                     .output_inserted_total
                     .inc_by(block_entries as u64);
 
-                ImportResult::Success(tracker.into())
+                InsertResult::Success(tracker.into())
             }
             Err(e) => {
                 warn!(error = ?e, "insert commit failed");
-                ImportResult::Failure(e)
+                InsertResult::Failure(e.into())
             }
         }
+    }
+
+    #[instrument(name = "sink", skip_all)]
+    pub async fn run(mut self, subsys: SubsystemHandle) -> Result<()> {
+        while let Some(Insert {
+            partition,
+            offset,
+            data,
+            reply,
+        }) = self.source.recv().await
+        {
+            // XXX: shoud errors be passed back or shoud this just crash and init shutdown?
+            let result = self.write(partition, offset, data).await;
+
+            // NOTE: no retry since oneshot cannel consumes self (i.e. `reply`)
+            if let Err(r) = reply.send(result) {
+                error!(result = ?r, "failed to send import result, initiating global shutdown");
+
+                // SAFETY: It is safe to just initiate shutdown but continue receiving _remaining_
+                // `Insert` requests, because it should not matter which consumer commits the
+                // offsets (or reports failure) as long as
+                //  - the data were actually inserted into ClickHouse (which they were above) and
+                //  - we re-install successfully inserted offsets into the head block of the
+                //    `InsertQueue`.
+
+                self.source.close();
+                subsys.request_global_shutdown();
+
+                if let InsertResult::Success(tpl) = r {
+                    self.insert_queue.reinstall_offsets(tpl);
+                }
+            }
+        }
+
+        // wait to gracefully shut down
+        subsys.on_shutdown_requested().await;
+
+        warn!("shutting down stream sink");
+
+        Ok(())
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "anonymizer"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Martin Matyášek <martin.matyasek@gmail.com>"]
 description = "GDPR-complient Kafka-to-ClickHouse ETL pipeline for HTTP logs"
 repository = "https://github.com/matyama/http-log-anonymizer"

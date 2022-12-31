@@ -7,7 +7,7 @@ use maplit::hashmap;
 use prometheus::process_collector::ProcessCollector;
 use prometheus::Registry;
 use prometheus_metric_storage::StorageRegistry;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio_graceful_shutdown::Toplevel;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -16,7 +16,7 @@ use anonymizer::{
     config::Config,
     error::Error,
     http_log::HttpLog,
-    sink::ClickHouseSink,
+    sink::{ClickHouseSink, Insert},
     source::KafkaSource,
     telemetry::{MetricsExporter, TracingExporter},
 };
@@ -54,25 +54,34 @@ async fn main() -> Result<()> {
     #[cfg(target_os = "linux")]
     storage_registry.register(Box::new(ProcessCollector::for_self()))?;
 
+    let topic = cfg.kafka.topic.clone();
+
+    // crete an insert request channel from Kafka source to clickhouse sink with
+    let (tx, rx) = mpsc::channel::<Insert<HttpLog, Error>>(cfg.mpsc_buffer_size);
+
     info!(
+        topic = topic,
         consumers = cfg.num_consumers,
+        mpsc_buffer = cfg.mpsc_buffer_size,
+        mpsc_timout = cfg.mpsc_send_timeout,
         "starting anonymizer pipeline"
     );
 
-    let topic = cfg.kafka.topic.clone();
-
-    // crete a shared clickhouse sink
-    let sink = ClickHouseSink::<HttpLog>::new(topic, cfg.ch, &storage_registry).await?;
-    let sink = Arc::new(Mutex::new(sink));
-
     // compose subsystems
     let exporter = MetricsExporter::new(cfg.telemetry.prometheus_exporter_port, registry);
-    let source = KafkaSource::new(cfg.num_consumers, cfg.kafka, sink, storage_registry);
+    let sink = ClickHouseSink::new(topic, cfg.ch, rx, &storage_registry).await?;
+    let source = KafkaSource::new(
+        cfg.num_consumers,
+        cfg.kafka,
+        tx,
+        Duration::from_millis(cfg.mpsc_send_timeout),
+        storage_registry,
+    );
 
-    // XXX: ClickHouseSink subsystem with mpsc channel to `KafkaConsumer`s
     Toplevel::new()
         .start("TracingExporter", |subsys| tracing.run(subsys))
         .start("MetricsExporter", |subsys| exporter.run(subsys))
+        .start("ClickHouseSink", |subsys| sink.run(subsys))
         .start("KafkaSource", |subsys| source.run(subsys))
         .catch_signals()
         .handle_shutdown_requests(Duration::from_secs(cfg.shutdown_timeout))

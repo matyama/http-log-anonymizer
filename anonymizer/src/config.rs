@@ -74,12 +74,17 @@
 //!  - `NUM_CONSUMERS` is the number of consumer tasks that will be spawned in the Tokio runtime
 //!  - `SHUTDOWN_TIMEOUT` is the time in seconds for how long will the application wait for its
 //!    subsystems to gracefully shut down
+//!  - `MPSC_BUFFER_SIZE` is the size of an `mpsc` buffer between Kafka consumers and ClickHouse
+//!    sink
+//!  - `MPSC_SEND_TIMEOUT` is the timeout in ms for sending insert reqeusts to ClickHouse sink
 //!
 //! # Example setup
 //! ```bash
 //! export RUST_LOG=anonymizer=INFO,librdkafka=WARN
 //! export NUM_CONSUMERS=2
 //! export SHUTDOWN_TIMEOUT=5
+//! export MPSC_BUFFER_SIZE=1024
+//! export MPSC_SEND_TIMEOUT=1000
 //! ```
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
@@ -138,6 +143,12 @@ pub struct Config {
     /// Component log levels as the standard `RUST_LOG` configuration string (default: `INFO`)
     #[serde(default = "default_rust_log")]
     pub rust_log: String,
+
+    /// Size of an `mpsc` buffer between Kafka consumers and ClickHouse sink
+    pub mpsc_buffer_size: usize,
+
+    /// Timeout in ms for sending insert requests from Kafka consumers to ClickHouse sink
+    pub mpsc_send_timeout: u64,
 
     /// Kafka integration configs
     pub kafka: KafkaConfig,
