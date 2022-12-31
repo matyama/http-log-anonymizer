@@ -47,6 +47,17 @@ impl OffsetTracker {
         }
     }
 
+    /// Replace current TPL with given `tpl`.
+    ///
+    /// Panics:
+    ///  - if current TPL is non-empty
+    ///  - if this tracker's topic is not in `tpl`
+    pub fn insert(&mut self, tpl: TopicPartitionList) {
+        assert_eq!(self.tpl.count(), 0);
+        assert!(!tpl.elements_for_topic(&self.topic).is_empty());
+        self.tpl = tpl
+    }
+
     /// Save given `(partition, offset)` pair for this tracker's registered topic.
     pub fn store(&mut self, partition: i32, offset: i64) {
         let mut p = match self.tpl.find_partition(&self.topic, partition) {

@@ -25,7 +25,7 @@
 //!  1. Runs [`anonymize_ip`] on the `remote_addr` field of [`HttpLog`](http_log::HttpLog)
 //!  1. Yields the log data to the [`ClickHouseSink`](sink::ClickHouseSink) to be either buffered
 //!     or inserted into the database
-//!  1. Based on the [`ImportResult`](sink::ImportResult) it either reports and propagates an
+//!  1. Based on the [`InsertResult`](sink::InsertResult) it either reports and propagates an
 //!     error, continues with the next message, or `commit`s Kafka offsets for the inserted batch
 //!
 //! See more implementation details in the description of the [`source`](source) module.
@@ -39,7 +39,7 @@
 //!     instance is not under too much stress (and inserts get rejected)
 //!
 //! Besides the data itself, each insert block also tracks the `(partition, offset)` pair of the
-//! last written data. This offset pair is later returned with [`ImportResult`](sink::ImportResult)
+//! last written data. This offset pair is later returned with [`InsertResult`](sink::InsertResult)
 //! back to a consumer for commit.
 //!
 //! See more implementation details in the description of the [`sink`](sink) module.
@@ -191,10 +191,10 @@
 //! ## Known issues & limitations
 //!  - There could be a better separation of the Kafka message ingestion & application logic of the
 //!    anonymizer pipeline
-//!  - The sink is currently shared with a standard [`Arc`](std::sync::Arc) and
+//!  - ~~The sink is currently shared with a standard [`Arc`](std::sync::Arc) and
 //!    [`Mutex`](tokio::sync::Mutex) combination, but it would be interesting to investigate some
 //!    _lock-free_ approaches or other design options how to overcome the congestion point
-//!    introduced by the critical section of data writes into the sink.
+//!    introduced by the critical section of data writes into the sink.~~ _[addressed in `v0.3.0`]_
 //!  - Investigation of more complex (and perhaps better) ways to achieve deduplication in
 //!    ClickHouse other than `ReplacingMergeTree` in DDL with `FINAL` in queries
 //!  - A big drawback of the current [`clickhouse_http_client::Client`], the underlying ClickHouse
@@ -209,14 +209,17 @@
 //!    till the next insert block finishes? It could be quite a long time depending on
 //!    `CH__RATE_LIMITa`. Or should it iterrupt the insert? But in that case consumers won't commit
 //!    offsets to Kafka, which essentially defeats the purpose of a _graceful_ shutdown.~~
+//!    _[addressed in `v0.2.0`]_
 //!  - Sink does not retry block inserts (as it does for the create table query). This is for two
 //!    reasons:
 //!     1. It could singnificantly slow down the processing (inside a critical section) depending
 //!        on the delay value (`CH__RATE_LIMIT`)
 //!     1. It would require a (potentially expensive) complete buffer clone because the underlying
 //!        [`clickhouse_http_client::Client`] takes the ownership of the batch being inserted.
-//!  - Currently there is no mechanism for _backpressure_ from the sink to the Kafka consumers
+//!  - ~~Currently there is no mechanism for _backpressure_ from the sink to the Kafka consumers~~
+//!    _[addressed in `v0.3.0`]_
 //!  - ~~Collecting performace metrics is not yet implemented (although this shouldn't be hard)~~
+//!    _[addressed in `v0.2.0`]_
 //!  - Generally way more integration and unit tests would be necessary for this to make it into a
 //!    production-ready state
 //!

@@ -149,6 +149,8 @@ services:
       - RUST_LOG
       - NUM_CONSUMERS=1
       - SHUTDOWN_TIMEOUT
+      - MPSC_BUFFER_SIZE
+      - MPSC_SEND_TIMEOUT
       - KAFKA__TOPIC
       - KAFKA__BROKERS=PLAINTEXT://broker:29092
       - KAFKA__GROUP_ID

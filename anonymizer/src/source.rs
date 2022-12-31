@@ -2,6 +2,7 @@
 //!
 //! TODO
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use derive_new::new;
@@ -14,16 +15,17 @@ use rdkafka::message::Message;
 use retry::delay::Fixed;
 use retry::retry;
 use stream_cancel::Valve;
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::error::SendTimeoutError;
+use tokio::sync::{mpsc, oneshot};
 use tokio_graceful_shutdown::SubsystemHandle;
-use tracing::{debug, debug_span, error, info, instrument, warn, Span};
+use tracing::{debug, error, info, instrument, warn, Span};
 
 use crate::anonymize_ip;
 use crate::config::KafkaConfig;
 use crate::error::Error;
 use crate::http_log::HttpLog;
 use crate::kafka::{LoggingConsumer, LoggingConsumerContext};
-use crate::sink::{ClickHouseSink, ImportResult};
+use crate::sink::{Insert, InsertResult};
 use crate::telemetry::Metrics;
 
 /// Create new Kafka consumer and subscribe it to a topic specified in config.
@@ -59,7 +61,8 @@ fn create_consumer(cfg: KafkaConfig) -> Result<LoggingConsumer> {
 #[instrument(name = "pipeline", skip_all)]
 pub async fn run_consumer(
     kafka: KafkaConfig,
-    sink: Arc<Mutex<ClickHouseSink<HttpLog>>>,
+    sink: mpsc::Sender<Insert<HttpLog, Error>>,
+    mpsc_send_timeout: Duration,
     metrics: Metrics,
     valve: Valve,
 ) -> Result<()> {
@@ -118,21 +121,43 @@ pub async fn run_consumer(
             log.remote_addr = anonymize_ip(log.remote_addr);
             debug!(partition, offset, ?log, "anonymized");
 
-            let sink_span = debug_span!("sink");
-            let result = {
-                // critical write section
-                let _enter = sink_span.enter();
-                let mut sink = sink.lock().await;
-                sink.write(partition, offset, log).await
+            let (reply_tx, reply_rx) = oneshot::channel();
+
+            let insert = Insert::new(partition, offset, log, reply_tx);
+
+            // XXX: retry on timeout?
+            if let Err(e) = sink.send_timeout(insert, mpsc_send_timeout).await {
+                let cause = match e {
+                    SendTimeoutError::Closed(_) => "sink stopped receiving",
+                    SendTimeoutError::Timeout(_) => "timeout",
+                };
+
+                error!(partition, cause, "request for data insert failed");
+
+                timer.observe_duration();
+                return KafkaResult::Err(KafkaError::MessageConsumption(
+                    RDKafkaErrorCode::Application,
+                ));
+            };
+
+            let result = match reply_rx.await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!(partition, error = ?e, "failed to receive insert response");
+                    timer.observe_duration();
+                    return KafkaResult::Err(KafkaError::MessageConsumption(
+                        RDKafkaErrorCode::Application,
+                    ));
+                }
             };
 
             let result = match result {
-                ImportResult::Pending => {
+                InsertResult::Pending => {
                     debug!(topic, partition, offset, "done processing message");
                     Ok(())
                 }
 
-                ImportResult::Success(tpl) => {
+                InsertResult::Success(tpl) => {
                     debug_assert!(
                         tpl.count() > 0,
                         "successful import must have non-empty offsets"
@@ -157,7 +182,7 @@ pub async fn run_consumer(
                     })
                 }
 
-                ImportResult::Failure(e) => {
+                InsertResult::Failure(e) => {
                     error!(partition, error = ?e, "insert commit failed");
                     KafkaResult::Err(KafkaError::MessageConsumption(
                         RDKafkaErrorCode::Application,
@@ -190,7 +215,8 @@ pub async fn run_consumer(
 struct KafkaConsumer {
     id: usize,
     kafka: KafkaConfig,
-    sink: Arc<Mutex<ClickHouseSink<HttpLog>>>,
+    sink: mpsc::Sender<Insert<HttpLog, Error>>,
+    mpsc_send_timeout: Duration,
     metrics: Metrics,
     valve: Valve,
 }
@@ -204,7 +230,15 @@ impl KafkaConsumer {
 
     #[instrument(name = "consumer", fields(id = self.id, topic = self.kafka.topic), skip_all)]
     async fn run(self, subsys: SubsystemHandle) -> Result<()> {
-        if let Err(e) = run_consumer(self.kafka, self.sink, self.metrics, self.valve).await {
+        let process_stream = run_consumer(
+            self.kafka,
+            self.sink,
+            self.mpsc_send_timeout,
+            self.metrics,
+            self.valve,
+        );
+
+        if let Err(e) = process_stream.await {
             error!(cause = ?e, "stream processing failed, initiating shutdown");
             subsys.request_global_shutdown();
         }
@@ -219,7 +253,8 @@ impl KafkaConsumer {
 pub struct KafkaSource {
     num_consumers: usize,
     kafka: KafkaConfig,
-    sink: Arc<Mutex<ClickHouseSink<HttpLog>>>,
+    sink: mpsc::Sender<Insert<HttpLog, Error>>,
+    mpsc_send_timeout: Duration,
     registry: StorageRegistry,
 }
 
@@ -239,6 +274,7 @@ impl KafkaSource {
                 id,
                 self.kafka.clone(),
                 self.sink.clone(),
+                self.mpsc_send_timeout,
                 metrics.clone(),
                 valve.clone(),
             )
