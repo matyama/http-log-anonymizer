@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-// XXX: make the limiter anaptive (learn an appropriate request rate from an init setting)
+// XXX: make the limiter adaptive (learn an appropriate request rate from an init setting)
 /// Component responsible for tracking the time since last recorded request and ensuring that it
 /// does not exceed specified limit.
 pub struct RequestLimiter {
@@ -15,12 +15,15 @@ pub struct RequestLimiter {
 impl RequestLimiter {
     /// Craete new limiter for given `request_rate` in seconds.
     ///
-    /// Panics if `request_rate == 0`.
+    /// Panics if `request_rate` is zero.
     #[inline]
-    pub fn new(request_rate: u64) -> Self {
-        assert!(request_rate > 0, "request rate cannot be zero");
+    pub fn new(request_rate: Duration) -> Self {
+        assert!(
+            !request_rate.is_zero(),
+            "request rate cannot be zero, got: {request_rate:?}",
+        );
         Self {
-            request_rate: Duration::from_secs(request_rate),
+            request_rate,
             last_request: Instant::now(),
         }
     }
@@ -45,7 +48,7 @@ mod tests {
 
     #[test]
     fn correctly_tracks_time_left() {
-        let mut limiter = RequestLimiter::new(2);
+        let mut limiter = RequestLimiter::new(Duration::from_secs(2));
 
         let time_left = limiter.remaining_time();
         assert!(time_left > Duration::from_secs(0));
@@ -62,6 +65,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "request rate cannot be zero")]
     fn panics_for_zero_rate() {
-        RequestLimiter::new(0);
+        RequestLimiter::new(Default::default());
     }
 }

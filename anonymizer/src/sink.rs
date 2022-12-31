@@ -34,12 +34,11 @@ impl TryFrom<&ClickHouseConfig> for Client {
     fn try_from(cfg: &ClickHouseConfig) -> Result<Self, Self::Error> {
         let mut builder = ClientBuilder::new().configurable(|http_client_builder| {
             http_client_builder
-                // TODO: add to env config
-                .timeout(Duration::from_secs(5))
+                .timeout(cfg.timeout)
                 // XXX: these can potentially be on defaults if rate limiter is disabled
                 .max_connections(1)
                 .max_connections_per_host(1)
-                .tcp_keepalive(Duration::from_secs(cfg.tcp_keepalive))
+                .tcp_keepalive(cfg.tcp_keepalive)
         });
 
         builder
@@ -246,11 +245,15 @@ where
         registry: &StorageRegistry,
     ) -> Result<Self> {
         let ch = clickhouse_http_client::Client::try_from(&cfg)?;
-        info!(url = cfg.url, user = cfg.user, "clickhouse client created");
+        info!(
+            url = cfg.url.as_str(),
+            user = cfg.user,
+            "clickhouse client created"
+        );
 
         if cfg.create_table {
             // make sure that the target table exists
-            let delay = Duration::from_secs(cfg.rate_limit.unwrap_or_default());
+            let delay = cfg.rate_limit.unwrap_or_default();
             async_retry(cfg.retries, delay, || async {
                 make_table::<T>(&ch, &cfg.target_table).await
             })
@@ -258,7 +261,8 @@ where
         }
 
         // XXX: does insert_period have to be an option? => use None to _disable_ rate limit
-        let request_limiter = RequestLimiter::new(cfg.rate_limit.unwrap_or(10));
+        let rate_limit = cfg.rate_limit.unwrap_or_else(|| Duration::from_secs(10));
+        let request_limiter = RequestLimiter::new(rate_limit);
 
         let metrics = Metrics::get_or_create(registry)?;
 

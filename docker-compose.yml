@@ -160,6 +160,7 @@ services:
       - CH__USER
       - CH__PASSWORD
       - CH__DATABASE
+      - CH__TIMEOUT
       - CH__TCP_KEEPALIVE
       - CH__TARGET_TABLE
       - CH__CREATE_TABLE

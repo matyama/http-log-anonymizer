@@ -26,6 +26,7 @@
 //!  - `CH__USER` and `CH__PASSWORD` are the credentials
 //!  - `CH__DATABASE` and `CH__TARGET_TABLE` is the database and table that the pipeline (sink)
 //!    will target its output
+//!  - `CH__TIMEOUT` is the maximum time in seconds for a ClickHouse request/response cycle
 //!  - `CH__CREATE_TABLE` specifies whether the sink should (re)create the `CH__TARGET_TABLE` when
 //!    it starts (`true`) or should expect it's alredy present in the database (`false`)
 //!  - `CH__MAX_BLOCK_SIZE` is the size of each insert block buffered by the sink before output
@@ -40,6 +41,7 @@
 //! export CH__USER=default
 //! export CH__PASSWORD=
 //! export CH__DATABASE=default
+//! export CH__TIMEOUT=10
 //! export CH__TCP_KEEPALIVE=60
 //! export CH__TARGET_TABLE=http_log
 //! export CH__CREATE_TABLE=true
@@ -73,10 +75,11 @@
 //!  - `RUST_LOG` is the standard Rust log configuration string
 //!  - `NUM_CONSUMERS` is the number of consumer tasks that will be spawned in the Tokio runtime
 //!  - `SHUTDOWN_TIMEOUT` is the time in seconds for how long will the application wait for its
-//!    subsystems to gracefully shut down
+//!    subsystems to gracefully shut down (accepts fractions as [`f64`])
 //!  - `MPSC_BUFFER_SIZE` is the size of an `mpsc` buffer between Kafka consumers and ClickHouse
 //!    sink
-//!  - `MPSC_SEND_TIMEOUT` is the timeout in ms for sending insert reqeusts to ClickHouse sink
+//!  - `MPSC_SEND_TIMEOUT` is the timeout in seconds for sending insert reqeusts to ClickHouse sink
+//!    (accepts fractions as [`f64`])
 //!
 //! # Example setup
 //! ```bash
@@ -84,10 +87,13 @@
 //! export NUM_CONSUMERS=2
 //! export SHUTDOWN_TIMEOUT=5
 //! export MPSC_BUFFER_SIZE=1024
-//! export MPSC_SEND_TIMEOUT=1000
+//! export MPSC_SEND_TIMEOUT=1
 //! ```
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use serde_with::serde_as;
 use url::Url;
 
 use crate::error::Error;
@@ -101,17 +107,22 @@ pub struct KafkaConfig {
     pub retry_delay: u64,
 }
 
+#[serde_as]
 #[derive(Debug, Deserialize)]
 pub struct ClickHouseConfig {
-    pub url: String,
+    pub url: Url,
     pub user: String,
     pub password: String,
     pub database: String,
-    pub tcp_keepalive: u64,
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    pub timeout: Duration,
+    #[serde_as(as = "serde_with::DurationSeconds<u64>")]
+    pub tcp_keepalive: Duration,
     pub target_table: String,
     pub create_table: bool,
     pub max_block_size: u16,
-    pub rate_limit: Option<u64>,
+    #[serde_as(as = "Option<serde_with::DurationSeconds<u64>>")]
+    pub rate_limit: Option<Duration>,
     pub retries: u64,
 }
 
@@ -131,14 +142,16 @@ fn default_rust_log() -> String {
     "INFO".to_string()
 }
 
+#[serde_as]
 #[derive(Debug, Deserialize)]
 pub struct Config {
     /// Number of Kafka consumers to start for the message ingest (default: 1)
     #[serde(default = "default_num_consumers")]
     pub num_consumers: usize,
 
-    /// Time in seconds of the graceful shutdown period
-    pub shutdown_timeout: u64,
+    /// Time in seconds of the graceful shutdown period (accepts fractions as [`f64`])
+    #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
+    pub shutdown_timeout: Duration,
 
     /// Component log levels as the standard `RUST_LOG` configuration string (default: `INFO`)
     #[serde(default = "default_rust_log")]
@@ -147,8 +160,10 @@ pub struct Config {
     /// Size of an `mpsc` buffer between Kafka consumers and ClickHouse sink
     pub mpsc_buffer_size: usize,
 
-    /// Timeout in ms for sending insert requests from Kafka consumers to ClickHouse sink
-    pub mpsc_send_timeout: u64,
+    /// Timeout in seconds for sending insert requests from Kafka consumers to ClickHouse sink
+    /// (accepts fractions as [`f64`])
+    #[serde_as(as = "serde_with::DurationSecondsWithFrac<f64>")]
+    pub mpsc_send_timeout: Duration,
 
     /// Kafka integration configs
     pub kafka: KafkaConfig,
