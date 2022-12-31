@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use maplit::hashmap;
@@ -63,7 +62,7 @@ async fn main() -> Result<()> {
         topic = topic,
         consumers = cfg.num_consumers,
         mpsc_buffer = cfg.mpsc_buffer_size,
-        mpsc_timout = cfg.mpsc_send_timeout,
+        mpsc_timout = ?cfg.mpsc_send_timeout,
         "starting anonymizer pipeline"
     );
 
@@ -74,7 +73,7 @@ async fn main() -> Result<()> {
         cfg.num_consumers,
         cfg.kafka,
         tx,
-        Duration::from_millis(cfg.mpsc_send_timeout),
+        cfg.mpsc_send_timeout,
         storage_registry,
     );
 
@@ -84,7 +83,7 @@ async fn main() -> Result<()> {
         .start("ClickHouseSink", |subsys| sink.run(subsys))
         .start("KafkaSource", |subsys| source.run(subsys))
         .catch_signals()
-        .handle_shutdown_requests(Duration::from_secs(cfg.shutdown_timeout))
+        .handle_shutdown_requests(cfg.shutdown_timeout)
         .await
         .map_err(|e| anyhow!(Error::ShutdownError(e)))
 }

@@ -53,8 +53,11 @@ impl OffsetTracker {
     ///  - if current TPL is non-empty
     ///  - if this tracker's topic is not in `tpl`
     pub fn insert(&mut self, tpl: TopicPartitionList) {
-        assert_eq!(self.tpl.count(), 0);
-        assert!(!tpl.elements_for_topic(&self.topic).is_empty());
+        assert_eq!(self.tpl.count(), 0, "cannot replace non-empty TPL");
+        assert!(
+            !tpl.elements_for_topic(&self.topic).is_empty(),
+            "topic mismatch"
+        );
         self.tpl = tpl
     }
 
@@ -116,5 +119,26 @@ mod tests {
         let tracker = OffsetTracker::new(TOPIC.to_owned());
         let stored = tracker.load().to_topic_map();
         assert!(stored.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot replace non-empty TPL")]
+    fn insert_non_empty() {
+        let mut tracker = OffsetTracker::new(TOPIC.to_owned());
+        tracker.store(0, 0);
+
+        let map = hashmap! { (TOPIC.to_owned(), 0) => Offset::Offset(1) };
+        let tpl = TopicPartitionList::from_topic_map(&map).unwrap();
+
+        tracker.insert(tpl);
+    }
+
+    #[test]
+    #[should_panic(expected = "topic mismatch")]
+    fn insert_wrong_topic() {
+        let mut tracker = OffsetTracker::new(TOPIC.to_owned());
+        let map = hashmap! { ("wrong-topic".to_owned(), 0) => Offset::Offset(0) };
+        let tpl = TopicPartitionList::from_topic_map(&map).unwrap();
+        tracker.insert(tpl);
     }
 }
