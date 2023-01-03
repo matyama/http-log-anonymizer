@@ -51,25 +51,19 @@ fn create_consumer(cfg: &KafkaConfig) -> Result<LoggingConsumer> {
 }
 
 #[derive(new)]
-struct KafkaConsumer<T> {
-    id: usize,
+struct Pipeline<'stream, T> {
     kafka: KafkaConfig,
+    consumer: &'stream LoggingConsumer,
     sink: SinkConnector<T, Error>,
     metrics: Metrics,
-    valve: Valve,
 }
 
-impl<T> KafkaConsumer<T> {
-    #[inline]
-    fn subsys_name(&self) -> String {
-        format!("KafkaConsumer-{}", self.id)
-    }
-
-    #[instrument(name = "commit", skip(self, consumer))]
-    fn commit_offsets(&self, consumer: &LoggingConsumer, tpl: TopicPartitionList) -> Result<()> {
+impl<'stream, T> Pipeline<'stream, T> {
+    #[instrument(name = "commit", skip(self))]
+    fn commit_offsets(&self, tpl: TopicPartitionList) -> Result<()> {
         retry(
             Fixed::from_millis(self.kafka.retry_delay).take(self.kafka.retries),
-            || consumer.commit(&tpl, CommitMode::Async),
+            || self.consumer.commit(&tpl, CommitMode::Async),
         )
         .map_err(|e| {
             error!(
@@ -83,19 +77,13 @@ impl<T> KafkaConsumer<T> {
     }
 }
 
-impl<T> KafkaConsumer<T>
+impl<'stream, T> Pipeline<'stream, T>
 where
     T: for<'a> TryFrom<BorrowedMessage<'a>> + Anonymize + SinkRow + Debug,
     for<'a> <T as TryFrom<BorrowedMessage<'a>>>::Error: Debug,
 {
-    // TODO: extract this out of consumer - or perhaps just the application logic
-    //  - i.e. keep here everything that depends on rdkafka
     #[instrument(name = "process", skip_all)]
-    async fn process<'stream, 'msg>(
-        &'stream self,
-        consumer: &'stream LoggingConsumer,
-        msg: BorrowedMessage<'msg>,
-    ) -> Result<()>
+    async fn process<'msg>(&'stream self, msg: BorrowedMessage<'msg>) -> Result<()>
     where
         'stream: 'msg,
     {
@@ -112,13 +100,11 @@ where
 
         // process a message
 
-        // NOTE: The config and message topic must be the same by construction/configuration because
-        // the consumer is subscribed to exactly one topic. By referencing config we save a clone.
-        let topic = &self.kafka.topic;
+        // NOTE: The config and message topic must be the same by construction/configuration.
         let partition = msg.partition();
         let offset = msg.offset();
 
-        debug!(topic, partition, offset, "processing message");
+        debug!(partition, offset, "processing message");
 
         let data = match T::try_from(msg) {
             Ok(data) => {
@@ -149,7 +135,7 @@ where
 
         let result = match result {
             InsertResult::Pending => {
-                debug!(topic, partition, offset, "done processing message");
+                debug!(partition, offset, "done processing message");
                 Ok(())
             }
 
@@ -162,7 +148,7 @@ where
                 // since offsets are sequential and commit retrospective, it is sufficient to
                 // commit just once after whole batch
 
-                self.commit_offsets(consumer, tpl)
+                self.commit_offsets(tpl)
             }
 
             InsertResult::Failure(e) => {
@@ -180,7 +166,29 @@ where
 
         result
     }
+}
 
+#[derive(new)]
+struct KafkaConsumer<T> {
+    id: usize,
+    kafka: KafkaConfig,
+    sink: SinkConnector<T, Error>,
+    metrics: Metrics,
+    valve: Valve,
+}
+
+impl<T> KafkaConsumer<T> {
+    #[inline]
+    fn subsys_name(&self) -> String {
+        format!("KafkaConsumer-{}", self.id)
+    }
+}
+
+impl<T> KafkaConsumer<T>
+where
+    T: for<'a> TryFrom<BorrowedMessage<'a>> + Anonymize + SinkRow + Debug,
+    for<'a> <T as TryFrom<BorrowedMessage<'a>>>::Error: Debug,
+{
     /// Run the anonymization pipeline.
     ///
     /// This function:
@@ -190,16 +198,16 @@ where
     #[instrument(name = "consumer", fields(id = self.id, topic = self.kafka.topic), skip_all)]
     async fn run(self, subsys: SubsystemHandle) -> Result<()> {
         let consumer = create_consumer(&self.kafka)?;
-        let msg_stream = self.valve.wrap(consumer.stream());
 
-        // XXX: perhaps split this into `KafkaStreamProcessor` with valve and `KafkaConsumer`
-        // without unnecessary fields but with `consumer` and `self.process(msg)`
+        let pipeline = Pipeline::new(self.kafka, &consumer, self.sink, self.metrics);
+
+        let msg_stream = self.valve.wrap(consumer.stream());
 
         info!("starting Kafka message stream processing");
 
         let stream_processing = msg_stream
             .map_err(|e| anyhow!(Error::Source(e)))
-            .try_for_each(|msg| self.process(&consumer, msg));
+            .try_for_each(|msg| pipeline.process(msg));
 
         if let Err(e) = stream_processing.await {
             error!(cause = ?e, "stream processing failed, initiating shutdown");
