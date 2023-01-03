@@ -235,6 +235,12 @@ pub mod sink;
 pub mod source;
 pub mod telemetry;
 
+/// Typeclass representing types that can be anonymized (transformed).
+pub trait Anonymize {
+    /// Turn self into a new value of the same type but with confidential information removed.
+    fn anonymize(self) -> Self;
+}
+
 /// Anonymize an IP address by replacing the last octet with 'x'.
 ///
 /// Any non-IP input is returned unchanged.

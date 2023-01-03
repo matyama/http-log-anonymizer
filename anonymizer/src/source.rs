@@ -1,6 +1,7 @@
 //! This module implements the Kafka source which drives the anonymizer pipeline logic
 //!
 //! TODO
+use std::fmt::Debug;
 use std::time::Duration;
 
 use anyhow::bail;
@@ -10,8 +11,7 @@ use futures::TryStreamExt;
 use prometheus_metric_storage::StorageRegistry;
 use rdkafka::consumer::CommitMode;
 use rdkafka::consumer::Consumer;
-use rdkafka::message::BorrowedMessage;
-use rdkafka::message::Message;
+use rdkafka::message::{BorrowedMessage, Message, OwnedMessage};
 use rdkafka::TopicPartitionList;
 use retry::delay::Fixed;
 use retry::retry;
@@ -20,23 +20,22 @@ use tokio::sync::mpsc;
 use tokio_graceful_shutdown::SubsystemHandle;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::anonymize_ip;
 use crate::config::KafkaConfig;
 use crate::error::Error;
-use crate::http_log::HttpLog;
 use crate::kafka::{LoggingConsumer, LoggingConsumerContext};
-use crate::sink::{Insert, InsertResult, SinkConnector};
+use crate::sink::{Insert, InsertResult, SinkConnector, SinkRow};
 use crate::telemetry::Metrics;
+use crate::Anonymize;
 
 /// Create new Kafka consumer and subscribe it to a topic specified in config.
 ///
 /// For configuration options see:
 /// [`librdkafka` docs](https://github.com/confluentinc/librdkafka/blob/master/CONFIGURATION.md)
 #[instrument(name = "create", skip_all)]
-fn create_consumer(cfg: KafkaConfig) -> Result<LoggingConsumer> {
+fn create_consumer(cfg: &KafkaConfig) -> Result<LoggingConsumer> {
     let consumer: LoggingConsumer = rdkafka::ClientConfig::new()
-        .set("group.id", cfg.group_id)
-        .set("bootstrap.servers", cfg.brokers)
+        .set("group.id", cfg.group_id.clone())
+        .set("bootstrap.servers", cfg.brokers.clone())
         .set("enable.partition.eof", "false")
         .set("session.timeout.ms", "6000")
         .set("auto.offset.reset", "latest")
@@ -52,15 +51,15 @@ fn create_consumer(cfg: KafkaConfig) -> Result<LoggingConsumer> {
 }
 
 #[derive(new)]
-struct KafkaConsumer {
+struct KafkaConsumer<T> {
     id: usize,
     kafka: KafkaConfig,
-    sink: SinkConnector<HttpLog, Error>,
+    sink: SinkConnector<T, Error>,
     metrics: Metrics,
     valve: Valve,
 }
 
-impl KafkaConsumer {
+impl<T> KafkaConsumer<T> {
     #[inline]
     fn subsys_name(&self) -> String {
         format!("KafkaConsumer-{}", self.id)
@@ -82,7 +81,13 @@ impl KafkaConsumer {
             anyhow!(Error::Source(e.error))
         })
     }
+}
 
+impl<T> KafkaConsumer<T>
+where
+    T: TryFrom<OwnedMessage> + Anonymize + SinkRow + Debug,
+    <T as TryFrom<OwnedMessage>>::Error: Debug,
+{
     // TODO: extract this out of consumer - or perhaps just the application logic
     //  - i.e. keep here everything that depends on rdkafka
     #[instrument(name = "process", skip_all)]
@@ -116,10 +121,10 @@ impl KafkaConsumer {
 
         // TODO: parse from BorrowedMessage? => no need to `msg.detach()`
         //  - alternatively detach immediately and change msg to an `OwnedMessge`
-        let mut log = match HttpLog::try_from(msg) {
-            Ok(log) => {
+        let data = match T::try_from(msg) {
+            Ok(data) => {
                 debug!(partition, offset, "message parsed");
-                log
+                data
             }
             Err(e) => {
                 warn!(cause = ?e, "ignoring invalid message");
@@ -132,12 +137,10 @@ impl KafkaConsumer {
             }
         };
 
-        // TODO: enum AnonymizeResult { Changed(String), Unchanged(String) }
-        //  - or just std::result::Result<String, String>
-        log.remote_addr = anonymize_ip(log.remote_addr);
-        debug!(partition, offset, ?log, "anonymized");
+        let data = data.anonymize();
+        debug!(partition, offset, ?data, "anonymized");
 
-        let result = match self.sink.output(partition, offset, log).await {
+        let result = match self.sink.output(partition, offset, data).await {
             Ok(result) => result,
             Err(e) => {
                 timer.observe_duration();
@@ -179,7 +182,6 @@ impl KafkaConsumer {
         result
     }
 
-    // XXX: generalize to `ClickHouseSink<O> where I: TryFrom<OwnedMessge> + Transform<I, O>, O: ...`
     /// Run the anonymization pipeline.
     ///
     /// This function:
@@ -188,8 +190,7 @@ impl KafkaConsumer {
     ///  1. Commits offsets via the consumer for successfully processed messages
     #[instrument(name = "consumer", fields(id = self.id, topic = self.kafka.topic), skip_all)]
     async fn run(self, subsys: SubsystemHandle) -> Result<()> {
-        // TODO: get rig of `.clone()`, tak ref if necessary
-        let consumer = create_consumer(self.kafka.clone())?;
+        let consumer = create_consumer(&self.kafka)?;
         let msg_stream = self.valve.wrap(consumer.stream());
 
         // XXX: perhaps split this into `KafkaStreamProcessor` with valve and `KafkaConsumer`
@@ -212,18 +213,21 @@ impl KafkaConsumer {
     }
 }
 
-// TODO: generalize over `HttpLog`
 /// Top-level pipeline subsystem compositor and driver
 #[derive(new)]
-pub struct KafkaSource {
+pub struct KafkaSource<T> {
     num_consumers: usize,
     kafka: KafkaConfig,
-    sink: mpsc::Sender<Insert<HttpLog, Error>>,
+    sink: mpsc::Sender<Insert<T, Error>>,
     mpsc_send_timeout: Duration,
     registry: StorageRegistry,
 }
 
-impl KafkaSource {
+impl<T> KafkaSource<T>
+where
+    T: TryFrom<OwnedMessage> + Anonymize + SinkRow + Debug + Send + 'static,
+    <T as TryFrom<OwnedMessage>>::Error: Debug,
+{
     #[instrument(name = "source", fields(topic = self.kafka.topic), skip_all)]
     pub async fn run(self, subsys: SubsystemHandle) -> Result<()> {
         info!("starting stream processing");
