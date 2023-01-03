@@ -1,5 +1,5 @@
 # anonymizer
-![Version: 0.3.0](https://img.shields.io/badge/version-0.3.0-blue)
+![Version: 0.4.0](https://img.shields.io/badge/version-0.4.0-blue)
 
 ## Environment
 The application expects certain set of environment variables (described below). A working
@@ -225,8 +225,8 @@ And to make the implementation more sane this crate also depends on:
  - [`stream-cancel`](https://crates.io/crates/stream-cancel) for stram interruption
 
 ### Known issues & limitations
- - There could be a better separation of the Kafka message ingestion & application logic of the
-   anonymizer pipeline
+ - ~~There could be a better separation of the Kafka message ingestion & application logic of
+   the anonymizer pipeline~~ _[addressed in `v0.4.0`]_
  - ~~The sink is currently shared with a standard [`Arc`](std::sync::Arc) and
    [`Mutex`](tokio::sync::Mutex) combination, but it would be interesting to investigate some
    _lock-free_ approaches or other design options how to overcome the congestion point
