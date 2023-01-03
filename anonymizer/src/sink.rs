@@ -9,7 +9,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use clickhouse_http_client::clickhouse_format::input::JsonCompactEachRowInput;
 use clickhouse_http_client::error::{ClientExecuteError, Error as ClickHouseError};
 use clickhouse_http_client::isahc::http::StatusCode;
@@ -18,6 +18,7 @@ use clickhouse_http_client::{Client, ClientBuilder};
 use derive_new::new;
 use prometheus_metric_storage::StorageRegistry;
 use serde_json::Value;
+use tokio::sync::mpsc::error::SendTimeoutError;
 use tokio::sync::{mpsc, oneshot};
 use tokio_graceful_shutdown::SubsystemHandle;
 use tracing::{debug, error, info, instrument, warn};
@@ -414,6 +415,66 @@ async fn make_table<T: SinkRow>(ch: &clickhouse_http_client::Client, table: &str
 
     info!(table, "made sure target table exists in clickhouse");
     Ok(())
+}
+
+/// Communication layer for components that want to send [`Insert`] requests to a sink and receive
+/// [`InsertResult`] resopnses.
+#[derive(Debug, new)]
+pub struct SinkConnector<T, E> {
+    /// Sender side of an [`mpsc`](tokio::sync::mpsc) channel to a sink
+    sink: mpsc::Sender<Insert<T, E>>,
+
+    /// Timeout for single send request that may result in an error due to backpressure
+    mpsc_send_timeout: Duration,
+}
+
+// NOTE: This could potentially be an extension trait but at the cost of an `#[async_trait]`.
+impl<T, E> SinkConnector<T, E>
+where
+    T: SinkRow,
+    E: Debug + From<ClickHouseError>,
+{
+    /// Send a `data` insert request to connected sink with associated `(partition, offset)` info.
+    ///
+    /// Communication is carried as follows:
+    ///  1. constructing a [`oneshot`](tokio::sync::oneshot) channel
+    ///  1. sending an insert request to the receiving (sink) side, including the send side of the
+    ///     `oneshot` channel
+    ///  1. awaiting sink response on the receiving side of the `oneshot` channel
+    ///
+    /// The call can either be successful or fail with eiter a [`Error::SinkRequest`] or
+    /// [`Error::SinkResponse`].
+    pub async fn output(&self, partition: i32, offset: i64, data: T) -> Result<InsertResult<E>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        let insert = Insert::new(partition, offset, data, reply_tx);
+
+        // TODO: retry on timeout
+        if let Err(e) = self.sink.send_timeout(insert, self.mpsc_send_timeout).await {
+            let cause = match e {
+                SendTimeoutError::Closed(_) => "sink stopped receiving",
+                SendTimeoutError::Timeout(_) => "timeout",
+            };
+
+            bail!(Error::SinkRequest {
+                cause,
+                partition,
+                offset
+            })
+        };
+
+        reply_rx.await.map_err(|e| anyhow!(Error::SinkResponse(e)))
+    }
+}
+
+impl<T, E> Clone for SinkConnector<T, E> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            sink: self.sink.clone(),
+            mpsc_send_timeout: self.mpsc_send_timeout,
+        }
+    }
 }
 
 #[cfg(test)]
