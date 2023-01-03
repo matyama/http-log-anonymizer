@@ -11,7 +11,7 @@ use futures::TryStreamExt;
 use prometheus_metric_storage::StorageRegistry;
 use rdkafka::consumer::CommitMode;
 use rdkafka::consumer::Consumer;
-use rdkafka::message::{BorrowedMessage, Message, OwnedMessage};
+use rdkafka::message::{BorrowedMessage, Message};
 use rdkafka::TopicPartitionList;
 use retry::delay::Fixed;
 use retry::retry;
@@ -85,8 +85,8 @@ impl<T> KafkaConsumer<T> {
 
 impl<T> KafkaConsumer<T>
 where
-    T: TryFrom<OwnedMessage> + Anonymize + SinkRow + Debug,
-    <T as TryFrom<OwnedMessage>>::Error: Debug,
+    T: for<'a> TryFrom<BorrowedMessage<'a>> + Anonymize + SinkRow + Debug,
+    for<'a> <T as TryFrom<BorrowedMessage<'a>>>::Error: Debug,
 {
     // TODO: extract this out of consumer - or perhaps just the application logic
     //  - i.e. keep here everything that depends on rdkafka
@@ -111,16 +111,15 @@ where
             .set(msg.payload_len() as f64);
 
         // process a message
-        let msg = msg.detach();
 
-        let topic = msg.topic().to_owned();
+        // NOTE: The config and message topic must be the same by construction/configuration because
+        // the consumer is subscribed to exactly one topic. By referencing config we save a clone.
+        let topic = &self.kafka.topic;
         let partition = msg.partition();
         let offset = msg.offset();
 
         debug!(topic, partition, offset, "processing message");
 
-        // TODO: parse from BorrowedMessage? => no need to `msg.detach()`
-        //  - alternatively detach immediately and change msg to an `OwnedMessge`
         let data = match T::try_from(msg) {
             Ok(data) => {
                 debug!(partition, offset, "message parsed");
@@ -225,8 +224,8 @@ pub struct KafkaSource<T> {
 
 impl<T> KafkaSource<T>
 where
-    T: TryFrom<OwnedMessage> + Anonymize + SinkRow + Debug + Send + 'static,
-    <T as TryFrom<OwnedMessage>>::Error: Debug,
+    T: for<'a> TryFrom<BorrowedMessage<'a>> + Anonymize + SinkRow + Debug + Send + 'static,
+    for<'a> <T as TryFrom<BorrowedMessage<'a>>>::Error: Debug,
 {
     #[instrument(name = "source", fields(topic = self.kafka.topic), skip_all)]
     pub async fn run(self, subsys: SubsystemHandle) -> Result<()> {
