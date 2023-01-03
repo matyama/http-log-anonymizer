@@ -6,6 +6,7 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::sink::{CompactJsonRow, SinkRow};
+use crate::{anonymize_ip, Anonymize};
 
 pub mod model {
     include!(concat!(env!("OUT_DIR"), "/http_log_capnp.rs"));
@@ -25,6 +26,13 @@ pub struct HttpLog {
     pub method: String,
     pub remote_addr: String,
     pub url: String,
+}
+
+impl Anonymize for HttpLog {
+    fn anonymize(mut self) -> Self {
+        self.remote_addr = anonymize_ip(self.remote_addr);
+        self
+    }
 }
 
 impl TryFrom<OwnedMessage> for HttpLog {
