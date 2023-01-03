@@ -1,7 +1,7 @@
 //! Module with the definition of a [`HttpLog`], its `capnp` representation, and its
 //! implementation of [`SinkRow`].
-use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice};
-use rdkafka::message::{Message, OwnedMessage};
+use capnp::{message::ReaderOptions, serialize::read_message_from_flat_slice_no_alloc};
+use rdkafka::message::{BorrowedMessage, Message};
 use serde::Serialize;
 use time::OffsetDateTime;
 
@@ -29,19 +29,20 @@ pub struct HttpLog {
 }
 
 impl Anonymize for HttpLog {
+    /// Anonymizes the [`remote_addr`](HttpLog::remote_addr) field (see [`anonymize_ip`]).
     fn anonymize(mut self) -> Self {
         self.remote_addr = anonymize_ip(self.remote_addr);
         self
     }
 }
 
-impl TryFrom<OwnedMessage> for HttpLog {
+impl TryFrom<BorrowedMessage<'_>> for HttpLog {
     type Error = capnp::Error;
 
-    fn try_from(value: OwnedMessage) -> Result<Self, Self::Error> {
+    fn try_from(value: BorrowedMessage<'_>) -> Result<Self, Self::Error> {
         let mut buffer = value.payload().unwrap_or_default();
 
-        let raw_data = read_message_from_flat_slice(&mut buffer, ReaderOptions::new())?;
+        let raw_data = read_message_from_flat_slice_no_alloc(&mut buffer, ReaderOptions::new())?;
 
         let data = raw_data.get_root::<http_log_record::Reader<'_>>()?;
 
