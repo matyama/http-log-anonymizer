@@ -1,5 +1,5 @@
 # anonymizer
-![Version: 0.4.0](https://img.shields.io/badge/version-0.4.0-blue)
+![Version: 0.4.1](https://img.shields.io/badge/version-0.4.1-blue)
 
 ## Environment
 The application expects certain set of environment variables (described below). A working

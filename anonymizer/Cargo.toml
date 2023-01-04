@@ -1,6 +1,6 @@
 [package]
 name = "anonymizer"
-version = "0.4.0"
+version = "0.4.1"
 authors = ["Martin Matyášek <martin.matyasek@gmail.com>"]
 description = "GDPR-complient Kafka-to-ClickHouse ETL pipeline for HTTP logs"
 repository = "https://github.com/matyama/http-log-anonymizer"
@@ -16,9 +16,19 @@ path = "src/lib.rs"
 name = "anonymizer"
 path = "src/main.rs"
 
-# TODO: rdkafka - add `features = ["dynamic-linking"] ` for `librdkafka` in Docker build
-#  - Docker issue: installed version of librdkafka is 1.6.0, required rdkafka >= 1.9.2
-# XXX: hyper it there only for the error type, unfortunately `prometheus-hyper` does not export it
+# allow for maximum size reduction optimizations
+[profile.release-min]
+inherits = "release"
+strip = true
+lto = true
+codegen-units = 1
+
+# NOTE: `rdkafka` should not enable the `dynamic-linking` feature
+#  - This is because we want a fully static binary for the Docker build which
+#    cross-compiles to musl target and run the binary in an Alpine image
+#  - https://github.com/LukeMathWalker/cargo-chef#running-the-binary-in-alpine
+
+# NOTE: `prometheus-hyper` does not export `hyper` itself, hence the dependency
 
 [dependencies]
 anyhow = "1.0"
