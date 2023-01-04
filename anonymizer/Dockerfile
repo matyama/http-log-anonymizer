@@ -1,18 +1,15 @@
-ARG RUST_TAG=1.66-slim
-FROM rust:${RUST_TAG} AS chef 
+ARG RUST_TAG=1.66.0-stable
+FROM clux/muslrust:${RUST_TAG} AS chef 
 RUN apt-get update -qq \
 	&& apt-get install -qq -y --no-install-recommends \
 		capnproto \
 		libcapnp-dev \
-    build-essential \
-    openssl \
-    libssl-dev \
-		pkg-config \
-		librdkafka1 \
 		librdkafka-dev \
+		upx-ucl \
 	&& rm -rf /var/lib/apt/lists/*
+USER root
 RUN cargo install cargo-chef 
-WORKDIR app
+WORKDIR /app
 
 FROM chef AS planner
 COPY . .
@@ -21,13 +18,23 @@ RUN cargo chef prepare  --recipe-path recipe.json
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 # Build and cache dependencies
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook \
+	--profile release-min \
+	--target x86_64-unknown-linux-musl \
+	--recipe-path recipe.json
 # Build application
 COPY . .
-RUN cargo build --release --bins
+RUN cargo build \
+	--profile release-min \
+	--target x86_64-unknown-linux-musl \
+	--bin anonymizer
+# Compress binary
+RUN upx --best --lzma \
+	/app/target/x86_64-unknown-linux-musl/release-min/anonymizer
 
 # Build runtime image without the Rust toolchain and additional dependencies
-FROM debian:bullseye-slim AS runtime
+FROM alpine:3.17 AS runtime
+RUN addgroup -S anonymizer && adduser -S anonymizer -G anonymizer
 ENV RUST_LOG anonymizer=INFO,librdkafka=WARN
 ENV NUM_CONSUMERS 2
 ENV SHUTDOWN_TIMEOUT 5
@@ -51,15 +58,9 @@ ENV CH__RATE_LIMIT 65
 ENV CH__RETRIES 3
 ENV TELEMETRY__PROMETHEUS_EXPORTER_PORT 9464
 ENV TELEMETRY__LOKI_URL http://localhost:3100
-WORKDIR app
-RUN apt-get update -qq \
-	&& apt-get install -qq -y --no-install-recommends \
-		librdkafka1 \
-		librdkafka-dev \
-    libc6 \
-	&& rm -rf /var/lib/apt/lists/*
 COPY --from=builder \
-	/app/target/release/anonymizer \
+	/app/target/x86_64-unknown-linux-musl/release-min/anonymizer \
 	/usr/local/bin/
+USER anonymizer
 CMD ["anonymizer"]
 
