@@ -3,7 +3,7 @@
 .envrc
 
 # Docs and other irrelevant sources
-README.md
+README.*
 LICENSE
 
 # Git
@@ -14,4 +14,10 @@ LICENSE
 .dockerignore
 Dockerfile
 docker-compose.yml
+
+# Build artifacts
+target/
+
+# IDEs
+.vscode/
 

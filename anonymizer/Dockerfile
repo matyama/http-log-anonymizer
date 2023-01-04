@@ -4,9 +4,9 @@ RUN apt-get update -qq \
 	&& apt-get install -qq -y --no-install-recommends \
 		capnproto \
 		libcapnp-dev \
-        build-essential \
-        openssl \
-        libssl-dev \
+    build-essential \
+    openssl \
+    libssl-dev \
 		pkg-config \
 		librdkafka1 \
 		librdkafka-dev \
@@ -54,11 +54,9 @@ ENV TELEMETRY__LOKI_URL http://localhost:3100
 WORKDIR app
 RUN apt-get update -qq \
 	&& apt-get install -qq -y --no-install-recommends \
-		capnproto \
-		libcapnp-dev \
 		librdkafka1 \
 		librdkafka-dev \
-        libc6 \
+    libc6 \
 	&& rm -rf /var/lib/apt/lists/*
 COPY --from=builder \
 	/app/target/release/anonymizer \

@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::bail;
 use anyhow::{anyhow, Result};
 use derive_new::new;
-use futures::TryStreamExt;
+use futures_util::TryStreamExt;
 use prometheus_metric_storage::StorageRegistry;
 use rdkafka::consumer::CommitMode;
 use rdkafka::consumer::Consumer;
