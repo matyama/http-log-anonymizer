@@ -52,7 +52,7 @@ serde_with = "2.1"
 stream-cancel = "0.8"
 thiserror = "1.0"
 time = { version = "0.3", features = ["serde"] }
-tokio = { version = "1.23", default-features = false, features = ["rt-multi-thread", "time", "macros", "sync"] }
+tokio = { version = "1.24", default-features = false, features = ["rt-multi-thread", "time", "macros", "sync"] }
 tokio-graceful-shutdown = "0.12"
 tracing = "0.1"
 tracing-loki = "0.2"
